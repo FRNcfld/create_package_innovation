@@ -1,0 +1,16 @@
+{
+  "required": false,
+  "minVersion": "0.8.5",
+  "package": "com.frnc.create_package_innovation.mixin.compat",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "create_package_innovation.refmap.json",
+  "mixins": [
+    "ItemSiloBlockEntityMixin",
+    "StorageNetworkIdentifierMixin",
+    "FluidPackagerBlockEntityMixin"
+  ],
+  "client": [],
+  "injectors": {
+    "defaultRequire": 0
+  }
+}

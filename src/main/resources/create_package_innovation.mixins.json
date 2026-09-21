@@ -1,0 +1,20 @@
+{
+  "required": true,
+  "minVersion": "0.8.5",
+  "package": "com.frnc.create_package_innovation.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "refmap": "create_package_innovation.refmap.json",
+  "mixins": [
+    "RepackagerBlockEntityMixin",
+    "PackagerBlockEntityMixin",
+    "ConnectivityHandlerMixin",
+    "ItemVaultBlockEntityMixin",
+    "FluidTankBlockEntityMixin",
+    "LevelChunkRemovalMixin",
+    "PackageRepackageHelperInvoker"
+  ],
+  "client": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

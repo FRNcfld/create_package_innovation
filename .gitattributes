@@ -1,0 +1,10 @@
+# 仓库内统一按 LF 存储。text=auto 只规范化"进仓库"的存储形式，不强制工作区换行，
+# 二进制文件（如 Logo.png）由 git 按内容自动识别，不会被改动。
+# 背景：从上游移植进来的几个 java 文件原本带 CRLF，已统一成 LF，规则在此固定下来。
+* text=auto
+
+# Disable autocrlf on generated files, they always generate with LF
+# Add any extra files or paths here to make git stop saying they
+# are changed when only line endings change.
+src/generated/**/.cache/cache text eol=lf
+src/generated/**/*.json text eol=lf

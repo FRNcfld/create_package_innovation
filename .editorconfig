@@ -1,0 +1,29 @@
+# 编辑器约定（EditorConfig）。绝大多数 IDE 都原生支持或可装插件读取本文件。
+# 目的：让"换行符 / 编码 / 缩进"这类纯风格差异不再出现在 diff 里。
+# 与 .gitattributes 的分工：.gitattributes 管"进仓库时如何存储"，本文件管"编辑器里怎么写"。
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.java]
+indent_style = space
+indent_size = 4
+
+[*.{json,mcmeta,yml,yaml}]
+indent_style = space
+indent_size = 2
+
+[*.gradle]
+indent_style = space
+indent_size = 4
+
+# Markdown 用行尾两个空格表示硬换行，所以这里不能自动去掉行尾空白。
+[*.md]
+trim_trailing_whitespace = false
+
+[*.{bat,cmd}]
+end_of_line = crlf

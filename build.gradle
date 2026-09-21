@@ -1,0 +1,207 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'maven-publish'
+    id 'net.minecraftforge.gradle' version '[6.0,6.2)'
+    id 'org.parchmentmc.librarian.forgegradle' version '1.+'
+    // MixinGradle（SpongePowered 官方插件）。ForgeGradle 6 的 UserDevExtension 移除了旧的
+    // mixin {} 块，没有这个插件，我们的 mixin 配置在开发环境根本不会被注册 —— 症状是
+    // mixin 编译进了包但运行时从不触发，且没有任何报错。
+    id 'org.spongepowered.mixin' version '0.7-SNAPSHOT'
+}
+
+version = mod_version
+group = mod_group_id
+
+base {
+    archivesName = mod_id
+}
+
+// Mixin 配置注册（由上面的 org.spongepowered.mixin 插件提供）。
+// refmap 名必须与 src/main/resources/<mod_id>.mixins.json 里的 "refmap" 字段一致。
+mixin {
+    add sourceSets.main, "${mod_id}.refmap.json"
+    // 主配置：核心功能（required=true，出问题就该硬失败）
+    config "${mod_id}.mixins.json"
+    // 兼容配置：针对其他模组的容器（如 Create: Connected 的 Item Silo）。
+    // 该配置 required=false + defaultRequire=0 —— 没装对应模组（或对方改了方法名）
+    // 时只打警告，不会拦启动，核心功能也不受影响。
+    config "${mod_id}.compat.mixins.json"
+}
+
+// Mojang ships Java 17 to end users in 1.18+, so your mod should target Java 17.
+java.toolchain.languageVersion = JavaLanguageVersion.of(17)
+
+println "Java: ${System.getProperty 'java.version'}, JVM: ${System.getProperty 'java.vm.version'} (${System.getProperty 'java.vendor'}), Arch: ${System.getProperty 'os.arch'}"
+
+minecraft {
+    // 映射渠道与版本在 gradle.properties 里改。
+    // parchment 是在 official 之上叠加社区维护的参数名与 javadoc，需要上面的 librarian 插件。
+    mappings channel: mapping_channel, version: mapping_version
+
+    // 必须为 true：让 ProcessResources 在 IDE 输出目录上运行，否则 IDE 里启动游戏读不到资源。
+    // See https://docs.gradle.org/current/dsl/org.gradle.language.jvm.tasks.ProcessResources.html
+    copyIdeResources = true
+
+    // 需要访问转换器时取消注释。文件最终必须位于 jar 内的 META-INF/accesstransformer.cfg。
+    // accessTransformer = file('src/main/resources/META-INF/accesstransformer.cfg')
+
+    runs {
+        // 以下配置对所有 run 生效
+        configureEach {
+            workingDirectory project.file('run')
+
+            property 'forge.logging.markers', 'REGISTRIES'
+
+            // 日志等级，可选值见
+            // https://stackoverflow.com/questions/2031163/when-to-use-the-different-log-levels
+            property 'forge.logging.console.level', 'debug'
+
+            // Create 使用了 MixinExtras，需要 refmap 重映射才能解析注入目标。
+            // 放在 configureEach 而不是只放在 client —— 任何 run 配置都会加载 Create，
+            // 缺了它会在 mixin 应用阶段直接崩掉。
+            property 'mixin.env.remapRefMap', 'true'
+            property 'mixin.env.refMapRemappingFile', "${projectDir}/build/createSrgToMcp/output.srg"
+
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        // 只保留 client / server 两个 run 配置。
+        // 从 MDK 模板继承的 gameTestServer 与 data（数据生成）已删除：本项目既没有 gametest
+        // 也没有数据生成器，留着是两个跑不起来的空壳（gameTestServer 在没有 gametest 时还会
+        // 直接崩）。将来要加回来，记得同时把 sourceSets.main.resources 的
+        // srcDir 'src/generated/resources' 也补回来。
+        // 注意 client { } 是空块但**不能删**：run 配置由这个块本身注册。
+        client {
+        }
+
+        server {
+            args '--nogui'
+        }
+    }
+}
+
+repositories {
+    // ---------------- JEI ----------------
+    maven {
+        // 2023 年 1 月之前的 JEI 文件
+        name = "Progwml6's maven"
+        url = "https://dvs1.progwml6.com/files/maven/"
+    }
+    maven {
+        // 2023 年 1 月之后的 JEI 文件
+        name = "Jared's maven"
+        url = "https://maven.blamejared.com/"
+    }
+    maven {
+        // JEI 的备用镜像
+        name = "ModMaven"
+        url = "https://modmaven.dev"
+    }
+
+    // ---------------- 机械动力 ----------------
+    maven { url = "https://maven.createmod.net" } // Create / Ponder / Flywheel
+    maven { url = "https://maven.ithundxr.dev/mirror" } // Registrate
+    maven { url = "https://raw.githubusercontent.com/Fuzss/modresources/main/maven/" } // ForgeConfigAPIPort
+
+    // ---------------- Mixin ----------------
+    // org.spongepowered:mixin 的注解处理器（编译期校验注入点并生成 refmap）
+    maven { url = "https://repo.spongepowered.org/repository/maven-public/" }
+
+    // ---------------- Create 附属模组（Modrinth）----------------
+    // Create: Connected / Create: Storage / Create: FluidLogistics 都只在 Modrinth 上发布。
+    // 用 exclusiveContent 把 maven.modrinth 这个 group 独占给 Modrinth，避免 Gradle 去别的仓库找。
+    // forRepositories(fg.repository) 是 ForgeGradle 的写法，少了它 Forge 自身的依赖会解析不到。
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = "Modrinth"
+                url = "https://api.modrinth.com/maven"
+            }
+        }
+        forRepositories(fg.repository)
+        filter {
+            includeGroup "maven.modrinth"
+        }
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${minecraft_version}-${forge_version}"
+
+    // ================= 机械动力 =================
+    // :slim 包不内嵌依赖，Ponder / Flywheel / Registrate 需要一并声明。
+    implementation(fg.deobf("com.simibubi.create:create-${minecraft_version}:${create_version}:slim") { transitive = false })
+    implementation(fg.deobf("net.createmod.ponder:Ponder-Forge-${minecraft_version}:${ponder_version}"))
+    compileOnly(fg.deobf("dev.engine-room.flywheel:flywheel-forge-api-${minecraft_version}:${flywheel_version}"))
+    runtimeOnly(fg.deobf("dev.engine-room.flywheel:flywheel-forge-${minecraft_version}:${flywheel_version}"))
+    implementation(fg.deobf("com.tterrag.registrate:Registrate:${registrate_version}"))
+
+    // Create 及其附属使用了 MixinExtras。
+    compileOnly(annotationProcessor("io.github.llamalad7:mixinextras-common:0.4.1"))
+    implementation("io.github.llamalad7:mixinextras-forge:0.4.1")
+
+    // Mixin 注解处理器：编译期校验 @Inject / @Redirect 目标并生成 refmap。
+    annotationProcessor 'org.spongepowered:mixin:0.8.5:processor'
+
+    // ================= Create 附属模组（Modrinth）=================
+    // 坐标 = maven.modrinth:<Modrinth 项目 slug>:<版本号 或 版本 ID>；版本在 gradle.properties 里改。
+    implementation fg.deobf("maven.modrinth:create-connected:${create_connected_version}")
+    implementation fg.deobf("maven.modrinth:create-storage-neo-forge:${create_storage_version}")
+    implementation fg.deobf("maven.modrinth:createfluidlogistic:${fluidlogistics_version}")
+
+    // ================= JEI =================
+    // 编译期只依赖 API，运行期用完整 jar。
+    compileOnly(fg.deobf("mezz.jei:jei-${minecraft_version}-forge-api:${jei_version}"))
+    compileOnly(fg.deobf("mezz.jei:jei-${minecraft_version}-common-api:${jei_version}"))
+    runtimeOnly(fg.deobf("mezz.jei:jei-${minecraft_version}-forge:${jei_version}"))
+}
+
+// 把 gradle.properties 里的属性展开进 mods.toml / pack.mcmeta 的 ${} 占位符。
+// 缺少属性会直接报错。copyIdeResources 开启时，IDE 启动游戏前同样会执行。
+// See https://docs.gradle.org/current/dsl/org.gradle.language.jvm.tasks.ProcessResources.html
+tasks.named('processResources', ProcessResources).configure {
+    // 必须显式指定 UTF-8：expand() 默认按平台编码读写，
+    // 在中文 Windows（file.encoding=GBK）上会把 mods.toml 里的中文全部搞坏，
+    // 包括会显示在模组列表里的 displayName 与 description。
+    filteringCharset = 'UTF-8'
+
+    var replaceProperties = [
+            minecraft_version: minecraft_version, minecraft_version_range: minecraft_version_range,
+            forge_version: forge_version, forge_version_range: forge_version_range,
+            loader_version_range: loader_version_range,
+            mod_id: mod_id, mod_name: mod_name, mod_license: mod_license, mod_version: mod_version,
+            mod_authors: mod_authors, mod_description: mod_description,
+    ]
+    inputs.properties replaceProperties
+
+    filesMatching(['META-INF/mods.toml', 'pack.mcmeta']) {
+        expand replaceProperties + [project: project]
+    }
+}
+
+tasks.named('jar', Jar).configure {
+    manifest {
+        attributes([
+                'Specification-Title'     : mod_id,
+                'Specification-Vendor'    : mod_authors,
+                'Specification-Version'   : '1',
+                'Implementation-Title'    : project.name,
+                'Implementation-Version'  : project.jar.archiveVersion,
+                'Implementation-Vendor'   : mod_authors,
+                'Implementation-Timestamp': new Date().format("yyyy-MM-dd'T'HH:mm:ssZ"),
+                // 告诉 Forge 加载哪些 mixin 配置（逗号分隔；第二个是可选兼容配置）
+                'MixinConfigs'            : "${mod_id}.mixins.json,${mod_id}.compat.mixins.json"
+        ])
+    }
+
+    finalizedBy 'reobfJar'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}

@@ -1,0 +1,99 @@
+# 本文件里的属性占位符由 build.gradle 的 processResources 任务用 gradle.properties 的取值展开，
+# 所以改值请改 gradle.properties，直接改这里不会生效。
+# 字段说明见 https://docs.minecraftforge.net/en/1.20.1/gettingstarted/mods.toml/
+# 注意：不要在注释里写出美元符号紧跟大括号的写法 —— expand() 走的是 Groovy 模板引擎，
+# 会把它当表达式解析并报 "Unexpected input"，整个 processResources 任务会失败。
+
+modLoader="javafml"
+loaderVersion = "${loader_version_range}"
+license = "${mod_license}"
+
+[[mods]]
+
+modId="${mod_id}"
+
+version="${minecraft_version}-${mod_version}"
+
+displayName="${mod_name}"
+
+authors="${mod_authors}"
+
+credits="基于 Create 及其附属模组：Create: Connected、Create: Storage、Create: FluidLogistics；配方查看：JEI"
+
+description='''${mod_description}'''
+
+# ---- 可选元数据 ----
+# 图标：写资源根目录下的相对路径，不是 assets/<mod_id>/ 下的路径。
+# 实际文件是 src/main/resources/Logo.png，所以这里就是 Logo.png —— 大小写必须与文件名逐字一致，
+# 因为它在 jar 里是区分大小写的 zip 条目。processResources 只对 mods.toml / pack.mcmeta 做模板
+# 展开，图片是原样拷贝，不会被 Groovy 模板引擎碰到。
+logoFile="Logo.png"
+# 主页与问题反馈地址：换成你的真实地址后取消注释。
+#displayURL="https://github.com/<你的用户名>/create_package_innovation"
+#issueTrackerURL="https://github.com/<你的用户名>/create_package_innovation/issues"
+# displayTest 默认就是 MATCH_VERSION：客户端与服务端版本不一致时会在连接界面提示。
+# 本模组两端都有内容，保持默认即可；纯客户端模组才考虑 IGNORE_ALL_VERSION。
+#displayTest="MATCH_VERSION"
+
+
+# ================= 依赖 =================
+
+[[dependencies.${mod_id}]]
+modId="forge"
+mandatory=true
+versionRange="${forge_version_range}"
+ordering="NONE"
+side="BOTH"
+
+[[dependencies.${mod_id}]]
+modId="minecraft"
+mandatory=true
+versionRange="${minecraft_version_range}"
+ordering="NONE"
+side="BOTH"
+
+# 机械动力：硬依赖。1.20.1 只维护 6.0.x，6.1 起不保证兼容，所以上限卡在 6.1。
+[[dependencies.${mod_id}]]
+modId="create"
+mandatory=true
+versionRange="[6.0.8,6.1.0)"
+ordering="NONE"
+side="BOTH"
+
+# ---------------- Create 附属模组：联动依赖 ----------------
+# 三个都声明为可选（mandatory=false）：没装时 Forge 静默跳过，不会拦住启动；
+# ordering="AFTER" 表示装了的话在本模组之后加载。若其中某个其实是硬依赖，
+# 把它的 mandatory 改成 true 即可。
+#
+# versionRange 统一写 [0,) 而不是精确范围：这三个模组各自的版本号规则并不统一，
+# 写死范围反而会在玩家装了其他小版本时弹出无谓的不匹配提示。
+#
+# 注意：下面三个 modId 是按各模组 jar 文件名推出来的（ForgeGradle 默认
+# archivesName = mod_id），首次启动时请在模组列表里核对：
+#   create_connected-1.2.3-mc1.20.1-all.jar   -> create_connected
+#   fxntstorage-1.2.7+mc-1.20.1-forge.jar     -> fxntstorage
+#   fluidlogistics-1.3.0-mc1.20.1.jar         -> fluidlogistics
+
+[[dependencies.${mod_id}]]
+modId="create_connected"
+mandatory=false
+versionRange="[0,)"
+ordering="AFTER"
+side="BOTH"
+
+[[dependencies.${mod_id}]]
+modId="fxntstorage"
+mandatory=false
+versionRange="[0,)"
+ordering="AFTER"
+side="BOTH"
+
+[[dependencies.${mod_id}]]
+modId="fluidlogistics"
+mandatory=false
+versionRange="[0,)"
+ordering="AFTER"
+side="BOTH"
+
+# JEI 不在这里声明：它只在构建脚本里（编译期 API + 运行期完整 jar），
+# 是客户端配方查看器，缺失时本模组应照常工作。
