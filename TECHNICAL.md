@@ -84,7 +84,8 @@ src/main/java/com/frnc/create_package_innovation/
 │   ├── ContainerHintStore.java    # 磁盘 half：SavedData(gdr_container_hints)，独立文件
 │   ├── VaultIdAccessor.java       # duck interface：读/写 BE 上的稳定 UUID
 │   ├── NetworkAnchorAccessor.java # duck interface：网络锚点位置
-│   └── FluidTargetAccessor.java   # duck interface：机器的流体存储位置
+│   ├── FluidTargetAccessor.java   # duck interface：机器的流体存储位置
+│   └── RepackagerLike.java        # 纯标记接口：opt-in = 「这台是理包机」（来源标记 + 红石闸门，§3.21/§3.9⑦）
 │
 ├── pool/                          # ★ 共享包裹池本身
 │   ├── SharedPackagePool.java     # 世界级 SavedData(gdr_shared_package_pool)：per-容器共享包裹池，key=UUID
@@ -107,7 +108,8 @@ src/main/java/com/frnc/create_package_innovation/
     └── compat/                            # 只有这里能出现可选模组的类
         ├── ItemSiloBlockEntityMixin.java        # Create: Connected 纵向保险库
         ├── StorageNetworkIdentifierMixin.java   # Create: Storage 网络锚点
-        └── FluidPackagerBlockEntityMixin.java   # Create: FluidLogistics 流体打包机
+        ├── FluidPackagerBlockEntityMixin.java   # Create: FluidLogistics 流体打包机
+        └── FluidRepackagerBlockEntityMixin.java # 流体理包机：红石闸门 opt-in（纯标记，见 §3.9⑦）
 
 src/main/resources/
 ├── create_package_innovation.mixins.json          # 主配置（required=true, defaultRequire=1）
@@ -140,7 +142,7 @@ src/main/resources/
 |---|---|---|---|
 | 1 | `@Inject(HEAD, cancellable)` | `RepackagerBlockEntity.attemptToRepackage(IItemHandler)V` | **部分重组入口**：零副作用预扫描；仅当部分/末班趟真的消费了碎片并产出包裹时才 `ci.cancel()`。完整订单 / 直通包裹 / 无可合成一律放行 vanilla |
 | 2 | `@Redirect`（`List.addAll`，`ordinal = 0`） | 同上方法的 `List.addAll(Collection)Z` | **理包机整批入池**：winner repack 后不再填自己的 `queuedExitingPackages` |
-| 3 | `@Inject(HEAD)` | `PackagerBlockEntity.tick()V` | **策略 A**：① 把该机私有积压整体交给池；② 空闲时从池取 1 个进私有队列。**注父类**，无 `instanceof` 守卫（见 §3.9①、§3.18） |
+| 3 | `@Inject(HEAD)` | `PackagerBlockEntity.tick()V` | **策略 A**：① 把该机私有积压整体交给池（**不打红石门**，来源标记 = 该机种类）；② 空闲时从池取 1 个进私有队列（**只取与自己同来源的**，§3.21；**实现了 `RepackagerLike` 的机器**还需通电：`canPoll = idle && (!repackagerLike || redstonePowered)`）。**注父类**；早期那个"只服务理包机"的 `instanceof` 守卫已删除，现在的 `instanceof RepackagerLike` 只用来限定来源与红石范围（见 §3.9①、§3.9⑦、§3.19、§3.21） |
 | 4 | `@Redirect`（`List.add`，**故意不写 ordinal**） | `PackagerBlockEntity.attemptToSend(List)V` | **普通打包机直接入池**：上游没有这个注入点 |
 | 5 | `@Inject(TAIL)` | `ConnectivityHandler.splitMulti(BlockEntity)V` | **容器全拆时爆池**：先判 partial vs 全拆，只有确认全拆才 `drainAndDrop` |
 | 6a | `@Inject(HEAD)` | `ItemVaultBlockEntity.notifyMultiUpdated()V` | 合裁决 + 惰性铸 UUID |
@@ -148,13 +150,14 @@ src/main/resources/
 | — | （extraData 三件套覆写） | `getExtraData/setExtraData/modifyExtraData` | 非 `@Inject`，是**接口方法覆写**（见 §3.11、§3.9⑨） |
 | 7 | `@Invoker` | `PackageRepackageHelper.repackBasedOnRecipes(...)` | 部分趟调 vanilla 部分合成（`protected`，已 `javap -p` 确认为 `protected`） |
 
-**兼容配置里的 3 个**（注入失败只警告）：
+**兼容配置里的 4 个**（注入失败只警告）：
 
 | 注入 | 目标 | 用途 |
 |---|---|---|
 | 全套（同 6a/6b + extraData 三件套） | Create: Connected `ItemSiloBlockEntity` | 纵向保险库适配器 |
 | 纯覆写（无 `@Inject`） | Create: Storage `StorageNetworkIdentifier` | 暴露网络锚点位置 |
 | `@Shadow` 字段 + 覆写 | Create: FluidLogistics `FluidPackagerBlockEntity` | 暴露 `fluidTarget` 面对的位置 |
+| **纯 `implements`（标记，无成员）** | Create: FluidLogistics `FluidRepackagerBlockEntity` | 让它被纳入红石闸门（§3.9⑦）——它**不继承** `RepackagerBlockEntity` |
 
 **流体罐适配器**（`FluidTankBlockEntityMixin`）只做 `write`/`read` 两个 `@Inject`——**故意少两样**，理由见 §3.18。
 
@@ -183,21 +186,27 @@ winner repack 整批（或普通打包机 attemptToSend 装好 1 个）
 
 **① 入池**
 
-三条入池路径，全部汇到 `SharedPackagePool.deposit(UUID, List<BigItemStack>)`：
+三条入池路径，全部汇到 `SharedPackagePool.deposit(UUID, List<BigItemStack>, Origin)`：
 
 1. **理包机**：`RepackagerBlockEntityMixin` redirect `attemptToRepackage` 末尾的
    `queuedExitingPackages.addAll(boxesToExport)`（已 `javap` 确认该方法是**整类里唯一**一处
    `List.addAll`，在偏移 **295–300**：`295: getfield queuedExitingPackages` /
-   `300: invokeinterface List.addAll`）。
+   `300: invokeinterface List.addAll`）。标 `Origin.REPACKAGER`。
 2. **普通打包机**：`PackagerBlockEntityMixin` redirect 父类 `attemptToSend` 里**唯一**一处
    `queuedExitingPackages.add(...)`（已 `javap` 确认在偏移 **726: getfield queuedExitingPackages** →
    **739: invokeinterface List.add`**）。**上游没有这个注入点**，见 §3.18。
+   标 `Origin.PACKAGER`（按 `self instanceof RepackagerLike` 判，不靠假设：没覆写 `attemptToSend` 的
+   理包机变体也会走到这条 redirect）。
 3. **任何来源的私有积压**：`tick` HEAD 的"上交"分支把 `queuedExitingPackages` 整体 deposit 后再清空
    ——这条是**生产者无关**的兜底：第三方打包机（如 FluidLogistics 从它自己的
    `ResourcePackagerEngine` 入队）没有可供 redirect 的单一接缝，但只要它把包裹放进私有队列，
-   下一个 tick 就会被交给池。
+   下一个 tick 就会被交给池。**来源标记取"正在上交的这台机器"的种类**（它的私有队列由它自己或其引擎填充，
+   所以这台机器就是生产者）。
 
 `deposit` 只收 `count > 0` 的条目（`SharedPackagePool.java` 第 145 行），这是防"凭空造物"的最后一道闸（§3.10④）。
+
+**每条入池记录都带上"生产者种类"**（`Origin`），这是 §3.21 的来源路由的前提；旧存档里没有这个标记的条目
+读成 `Origin.UNKNOWN`，任何机器都能取（行为与改动前一致）。
 
 **② 按需取（策略 A）**
 
@@ -209,19 +218,29 @@ if (level == null || level.isClientSide) return;
 
 boolean hasQueue = !self.queuedExitingPackages.isEmpty();
 boolean idle = self.animationTicks == 0 && self.heldBox.isEmpty() && !hasQueue;
-if (!hasQueue && !idle) return;                 // 无事可做，省掉 key 解析
+// 「这台是理包机吗」同时决定两件事：来源标记（§3.21）与红石闸门（§3.9⑦）
+boolean repackagerLike = self instanceof RepackagerLike;
+boolean canPoll = idle && (!repackagerLike || self.redstonePowered);
+Origin origin = repackagerLike ? Origin.REPACKAGER : Origin.PACKAGER;
+if (!hasQueue && !canPoll) return;               // 无事可做，省掉 key 解析
 
 UUID vaultKey = VaultIdentity.vaultIdOf(self);  // ← 身份解析（§2.4）
 if (vaultKey == null) return;
 ...
-if (hasQueue) { /* 先 deposit 再 clear —— 见 §3.19 */ }
-if (!idle) return;
-BigItemStack pkg = pool.poll(vaultKey);
+if (hasQueue) { /* 先 deposit(…, origin) 再 clear，任何机器都不看红石 —— 见 §3.19 */ }
+if (!canPoll) return;                           // 取包：只有 opt-in 的机器看红石
+BigItemStack pkg = pool.poll(vaultKey, origin);  // ← 只取与自己同来源的包裹（§3.21）
 if (pkg != null) self.queuedExitingPackages.add(pkg);
 // ↓ vanilla tick() 紧接着从队首取它：heldBox = queue[0]; animationTicks = 20; ...
 ```
 
-**注意：这里没有 `if (!self.redstonePowered) return;`。** 这是与上游的**刻意分歧**，理由见 §3.9⑦。
+**两条独立的收窄规则**：
+
+1. **来源路由（§3.21）**：入池时打上"理包机产 / 打包机产"标记，取包时**只取与自己同来源的**。所以一台
+   后贴上去的打包机不会把理包机的有序包裹搬走（也就不会从打包机的输出面发出去）。
+2. **红石闸门（§3.9⑦）**：只加在"取包"（`canPoll`）这一半、且只对 opt-in 了 `RepackagerLike` 的机器生效；
+   "上交/入池"那一半对任何机器都不加闸门。这是与上游的**刻意分歧**（上游把闸门加在整个注入、所有机器上，
+   会把上交一起挡掉）。**普通打包机因此不看自己的红石，照常取包。**
 
 **为什么安全**：注入只在队列空、`heldBox` 空、无动画时往队列尾部加 1 个包，vanilla tick 紧接着从
 队首取它。私有队列始终 0~1 个元素，vanilla 取件逻辑看不到任何差异。`heldBox` 的被动清空协议
@@ -322,7 +341,9 @@ vaultIdOf(packager)
 - **打掉机器不爆池**：池跟着存档走，重放机器即恢复（§3.9④）
 - **容器全拆才爆池**：`ConnectivityHandlerMixin`（多方块）/ `LevelChunkRemovalMixin`（单方块）
 - **reshape 不爆不丢**：多方块的身份是 BE 上的 UUID，reshape 期间 key 完全不变（§3.11）
-- **漏抽有兜底**：`OrphanSweep` + 持久化提示（§3.14）
+- **不漏抽有兜底**：`OrphanSweep` + 持久化提示（§3.14）
+- **按来源路由不丢东西**：`poll` 只是**跳过**别的来源（§3.21），不删除、不搬运；被跳过的条目一直留在池里，
+  直到同来源的机器来取、或容器被拆时 `drainAndDrop` 全量爆出
 - **部分重组的守恒保证**：消耗==删除（结构性，§3.10①②）、产物只出自 vanilla 方法（§3.10③）、
   `count<=0` 过滤（§3.10④）、余料只托管 SavedData（§3.10⑤）
 
@@ -665,33 +686,93 @@ vaultBoundingBoxOf(...)`，`checkMethodVisibility` 报错。
 >
 > **正确方案见 §3.11。**
 
-**⑦ tick HEAD 灌队列与红石闸门【⚠️ 本模组刻意与上游相反】**
+**⑦ tick HEAD 灌队列与红石闸门【⚠️ 本模组刻意与上游不同：只闸 opt-in 机器的"取包"，绝不闸"上交"】**
 
-**上游的写法**：在 `feedFromPool` 顶部加 `if (!self.redstonePowered) return;`，理由是"我们的 tick 注入
-绕过了 lazyTick 的红石门，所以必须补回来"。
+**上游的写法**：在 `feedFromPool` 顶部加 `if (!self.redstonePowered) return;`——闸门加在**整个注入**、
+**所有机器**上，把"上交"和"取包"一起挡掉，理由是"我们的 tick 注入绕过了 lazyTick 的红石门，所以必须补回来"。
 
-**本模组刻意不加这道闸门。** 这段判断写在 `PackagerBlockEntityMixin` 的 javadoc
-（`PackagerBlockEntityMixin.java:78-89`，含 "⚠️ Deliberately NOT gated on redstonePowered"）。**不要"修回去"。**
+**本模组的做法（相对上游收窄了两道）**：
 
-**为什么上游的写法是错的（本模组的分析）**：
+1. **只闸"取包"(poll)，不闸"上交/入池"(hand-over)**——后者对**任何**机器都无条件执行。
+2. **红石闸门只对 opt-in 了 `RepackagerLike` 的机器生效**——Create 的理包机与 FluidLogistics 的流体理包机
+   都 opt-in 了；普通打包机不 opt-in，不看自己的红石，永远照常取包。
+
+```java
+boolean repackagerLike = self instanceof RepackagerLike;           // ← 只认"标记接口"，不认具体类
+boolean canPoll = idle && (!repackagerLike || self.redstonePowered);  // 只有 opt-in 的机器看红石
+if (!hasQueue && !canPoll) return;                   // 上交(hasQueue)不受闸门影响
+...
+if (hasQueue) { pool.deposit(...); queue.clear(); }  // (A) 上交：任何机器都不看红石
+if (!canPoll) return;                                // (B) 取包：只有 opt-in 的机器看红石
+```
+
+这段判断写在 `PackagerBlockEntityMixin` 的 handler 里（`PackagerBlockEntityMixin.java:87-116`，
+含 "⚠️ The redstone gate is scoped to the REPACKAGER — and only to the poll half"）。
+
+**为什么闸门只能加在取包这一半**：
 
 1. vanilla `tick()` **本身没有任何红石检查**——它无条件排空 `queuedExitingPackages`。
-   已 `javap` 确认：`PackagerBlockEntity.tick()` 的字节码里对 `redstonePowered` **没有一次 `getfield`**；
-   `attemptToSend` 里也没有。只有 `lazyTick`（偏移 20–26：`getfield redstonePowered` / `ifne` / `return`）
-   和红石上升沿路径读它。
-2. 红石只决定 `attemptToSend` **是否往队列里填包**（GATE 1），不决定"是否把队列里的包发出去"。
-3. 所以给我们的灌入加红石门 = **让我们比 vanilla 更严**：一个包裹已经被某台机器交给池、之后那台机器的
-   红石又被切断，那个包裹就**永远取不回来**——订单静默停摆，玩家看到的是"物品被吞了"。
-4. 匹配 vanilla（队列里有就发，不管有没有红石）**是池能安全工作的前提**。
+   已 `javap` 确认（6.0.8-289 slim jar）：`tick()`（偏移 22–135）里对 `redstonePowered` **没有一次
+   `getfield`**；`attemptToSend` 里也没有。只有 `lazyTick`（偏移 20–26：`getfield redstonePowered` /
+   `ifne` / `return`）与 `activate()`（偏移 2：`iconst_1; putfield`，红石上升沿）读写它。
+2. 红石只决定 `attemptToSend` **是否往队列里填包**（即只决定"生产"），不决定"队列里已有的包发不发"。
+3. 给**上交**加闸门 = **让我们比 vanilla 更严**，而且是纯粹的损失：一台机器已经把包裹生产出来放在私有
+   队列里，红石被切断后它连"交给池"都做不到；容器上其他机器若也断电，这些包裹就锁在一台没人取的机器里
+   ——订单静默停摆，玩家看到的是"物品被吞了"。上交是**生产者无关**的规则（§3.19），它必须无条件执行。
+4. 给**取包**加闸门**不会丢任何东西**：包裹留在 SavedData 的池里，机器重新通电就继续发。
 
-**真正保护堵塞机的仍然是 `heldBox` 守卫**（`!self.heldBox.isEmpty()` → `idle == false`），
-与红石无关。这台机器堵塞时它不取新包，活自动流向空闲兄弟。
+**为什么闸门只认理包机，以及为什么用标记接口而不是类判断**（来自现场反馈；闸门第一版加在父类上、对所有
+机器生效，是错的）：那样做会**把普通打包机也闸住**——而共享容器上的普通打包机常常根本没接红石（它只是
+"发货端"），结果整池包裹没人取，表现为"打包机必须通红石才能取包裹"。理包机才是玩家真正接线、并且期望
+"断电即停"的那台机器。所以：
 
-> ❌ **不要**改成 `if (!self.redstonePowered) return;`。
+- **理包机**（Create 的 `RepackagerBlockEntity`）：切断红石后最多一个 lazy tick 就停止取包（用户选定语义）。
+- **普通打包机**：不看自己的红石，照常取包（与改动前完全一致）。
+
+**但"理包机"不能用 `instanceof RepackagerBlockEntity` 判断**——Create: FluidLogistics 的流体理包机
+`FluidRepackagerBlockEntity` **直接继承 `PackagerBlockEntity`**，不是 `RepackagerBlockEntity` 的子类
+（已 `javap` 确认，见 §6.6）。用类判断会把它当成普通打包机、不闸（实测到的漏网）。同时主 mixin 里也不能写
+`instanceof com.yision.*`（AGENTS.md §3③：可选模组的类只能出现在 `mixin/compat/`）。所以改用**普通包里的纯
+标记接口** `identity/RepackagerLike`：
+
+| 谁 | 怎么 opt-in |
+|---|---|
+| Create 的理包机 | `RepackagerBlockEntityMixin implements RepackagerLike`（主配置） |
+| FluidLogistics 的流体理包机 | `mixin.compat.FluidRepackagerBlockEntityMixin implements RepackagerLike`（兼容配置，纯 `implements`、无成员） |
+| 普通打包机（含别的 mod 直接继承 `PackagerBlockEntity` 的） | **不 opt-in** → 不被闸 |
+
+主 mixin 因此只 `instanceof RepackagerLike`，**不提及任何 `PackagerBlockEntity` 子类**，
+也不提及任何可选模组类。以后要支持"某个变体也该断电即停"，只需给它的 compat mixin 加一行 `implements`。
+
+> **由此带来的已知后果（有意接受）**：容器上**同时**有理包机（opt-in）和普通打包机时，切断理包机的红石
+> **不会**让发送停下来——普通打包机会继续把池里的包裹取走。想要"整个容器断电全停"，就得给容器上
+> **每一台**机器都接线（或者干脆只用理包机）。
+
+**闸门的响应性**（已 `javap` 确认）：`redstonePowered` 是 public 字段，由 `activate()`（红石上升沿）置
+`true`，并由 `lazyTick()` 从方块状态 `PackagerBlock.POWERED` 重新读出；`SmartBlockEntity` 的构造器调用
+`setLazyTickRate(10)`（字节码 `bipush 10`），也就是 lazyTick 每 **10 tick（0.5 秒）**跑一次。所以：
+**通电**基本立刻生效（上升沿置位），**断电**最多滞后一个 lazy tick（≤0.5 秒）才停止取包。
+
+**真正保护堵塞机的仍然是 `heldBox` 守卫**（`!self.heldBox.isEmpty()` → `idle == false`），与红石无关。
+这台机器堵塞时它不取新包，活自动流向空闲兄弟。
+
+> ❌ **不要**把闸门挪到 `feedFromPool` 顶部（`if (!self.redstonePowered) return;`）——那会把**上交**一起挡掉，
+> 重新打开上面第 3 条的"吞物品"路径。
+> ❌ **不要**把闸门扩大到所有机器（即去掉 `!repackagerLike ||` 那一半）——普通打包机会因此停止取包，
+> 就是"打包机必须通红石才能取包裹"这个已经修过的问题。
+> ❌ **不要**把判据改回 `instanceof RepackagerBlockEntity`——Create: FluidLogistics 的流体理包机不继承它，
+> 会漏闸（这正是引入 `RepackagerLike` 的原因）。
+> ❌ **不要**把闸门整个删掉——理包机侧的闸门是用户选定的行为，删了就是"断电仍在取包"。
 > ❌ **不要**用 `redstoneModeActive()` 当红石门——`RepackagerBlockEntity` 把它 override 成恒 `true`
-> （它是"模式选择器"，不是红石门）。
+> （已 `javap` 确认：`iconst_1; ireturn`；它是"模式选择器"，不是红石门）。
 >
-> （本仓库 `AGENTS.md` §4 的禁区表里也列了这一条，指向 `PackagerBlockEntityMixin.java:78-89`。）
+> ⚠️ **别把 `RepackagerLike` 和早期被删掉的那个守卫混淆**：老守卫是
+> `if (!(self instanceof RepackagerBlockEntity)) return;`，语义是"普通打包机根本不参与共享池"，
+> **已永久删除**（普通打包机必须参与，见 §3.19）；`RepackagerLike` 只用来**限定红石闸门的范围**，
+> 对任何机器的参与都没有影响，而且它是"opt-in 标记"，不是"类型白名单"。
+>
+> （本仓库 `AGENTS.md` §4 的禁区表里也列了这一条：**禁止给"灌入/上交"加闸门**、
+> **禁止把取包闸门扩大到普通打包机**。）
 
 **⑧ 上游 v0.5.0 的 BoundingBox-keyed 时代已结束：本模组的 key 恒为 UUID**
 
@@ -899,6 +980,8 @@ IllegalClassLoadError: ... is in a defined mixin package ... cannot be reference
 ```
 
 本模组三个 duck interface 都在 identity 包：`VaultIdAccessor`、`NetworkAnchorAccessor`、`FluidTargetAccessor`。
+另有一个**纯标记接口** `RepackagerLike`（无方法）也在 identity 包——它同样不能在 `mixin` 包里，
+理由与上面三个完全一样（§3.9⑦）。
 
 > **已知的既存边界情形，不要照抄**：`PartialRepackager`（partial 包）`import` 了
 > `com.frnc.create_package_innovation.mixin.PackageRepackageHelperInvoker`。
@@ -1040,7 +1123,7 @@ public BlockPos createPackageInnovation$networkAnchorPos() {
 
 | 类 | 角色 |
 |---|---|
-| `ContainerHintRegistry` | 内存 half。`Map<MinecraftServer, Map<UUID, Hint>>`（外层 **WeakHashMap**，所以换世界不会泄漏） |
+| `ContainerHintRegistry` | 内存 half。`Map<MinecraftServer, State>`（外层 **WeakHashMap**，所以换世界不会泄漏）。`State` = key→hint 表 **+ 按 (维度, 区块) 分桶的派生索引**（索引不落盘，从磁盘播种时重建） |
 | `ContainerHintStore` | 磁盘 half。独立 SavedData，id **`gdr_container_hints`** |
 
 `Hint` 是 `record (ResourceKey<Level> dimension, BlockPos pos, boolean multiblock)`：
@@ -1053,8 +1136,12 @@ public BlockPos createPackageInnovation$networkAnchorPos() {
 所以 `remember` 先比较：**只有 hint 真的出现或变化时才 `ContainerHintStore.put`**：
 
 ```java
-Hint previous = hints(server).put(key, hint);
-if (!hint.equals(previous)) ContainerHintStore.get(server).put(key, hint);   // ← 只在变化时落盘
+State state = state(server);                          // 首次访问时从磁盘播种（并重建区块索引）
+Hint previous = state.byKey.put(key, hint);
+if (hint.equals(previous)) return;                    // ← 第一个 tick 之后，重复记录只是这次 map 比较
+if (previous != null) unindex(state, key, previous);  // 位置变了要换桶（reshape 可能改报另一个部件）
+index(state, key, hint);
+ContainerHintStore.get(server).put(key, hint);        // ← 只在 hint 真的出现/变化/移动时落盘
 ```
 
 第一个 tick 之后，重复记录同一个位置只是一次 map 比较，什么都不做。
@@ -1070,8 +1157,10 @@ if (!hint.equals(previous)) ContainerHintStore.get(server).put(key, hint);   // 
 
 ```
 1. 只处理 ServerLevel + LevelChunk
-2. hints 为空 → return（绝大多数区块加载走这条）
-3. 只挑出 dimension 相同、且 (pos.x>>4, pos.z>>4) 等于本次加载区块的 hint
+2. ContainerHintRegistry.keysInChunk(server, dimension, chunkX, chunkZ) → 空则 return
+   ★ 只取"hint 位置落在本次加载区块"的那一桶，**不是全量遍历**（绝大多数区块加载走这条）
+3. ★ 惰性淘汰：key 下既没有池内容（pool.pending == 0）也没有被接管的订单（tracker.hasOrders == false）
+   → forget(key)（内存 + 磁盘）后 continue —— 理由见下面「惰性淘汰」
 4. 便宜判定优先：chunk.getBlockEntity(pos)
      - 非 null 且 !multiblock  → 槽位被占 → 池可达 → continue（不爆）
      - 非 null 且 multiblock 且 BE 的 UUID == key → 就是它 → continue
@@ -1086,10 +1175,54 @@ if (!hint.equals(previous)) ContainerHintStore.get(server).put(key, hint);   // 
 **为什么 `b` 必须存在**：见 §3.17——`±11` 半径是按保险库几何定的，对"高度来自配置"的流体罐不够用，
 会把**活着的**容器的池爆掉。
 
+#### 惰性淘汰：hint 集合靠什么保持有界
+
+**问题**：hint 是 `VaultIdentity.vaultIdOf` **每次解析身份都会记一次**的（每台机器每 tick 一次），也就是
+说**只要某个容器上挂过机器**就会留下一条 hint——不管它里面到底有没有包裹。而 hint 原先**只在 drain
+真的解析到那个键时才被删**。于是两种最常见的死 hint 会永久留在内存和磁盘里：
+
+- 机器被拆掉、容器还在（再也不会有 `vaultIdOf` 调用，drain 也不会发生）
+- 容器把池里的包裹正常发完了（池空了，但键从未被 "drain" 过）
+
+**做法**：sweep 在遍历本区块的 hint 时，先问一句"这个键下面还有东西可救吗"：
+
+```java
+if (pool.pending(key) == 0 && !tracker.hasOrders(key)) {   // 既没有池内容，也没有被接管的订单
+    ContainerHintRegistry.forget(server, key);             // 内存 + 磁盘一起清
+    continue;                                              // 不必再探活
+}
+```
+
+淘汰是**静默**的（这是正常清理，不是"救回了物品"），但开 `DEBUG_LOGGING` 时能看见这一行，便于验证：
+
+```
+[CPI-POOL] evicted a dead container hint (no packages, no tracked orders; dim=<维度>, pos=<坐标>)
+```
+
+**为什么这样淘汰是安全的（不是"猜"）**：hint 的唯一用途是让 sweep 找到「容器没了但键下面还有东西」的
+情况。键下面什么都没有时，**任何 drain 都不可能为它回收出物品**——留着它纯属占地方。而一旦这个键
+重新有东西，hint 会立刻被重新记上：所有入池路径都是**先** `VaultIdentity.vaultIdOf(...)`（内部
+`remember`）**再** deposit，所以"有数据"必然蕴含"有 hint"，不存在窗口。
+
+**两个刻意的顺序选择**：
+
+1. 淘汰检查放在**探活之前**——没有东西可救的键根本不需要跑存活探测；同时这让
+   `[CPI-POOL] orphan sweep dropped a pool whose container is gone` 这行**只在真的回收了东西时**才出现
+   （以前对一个空池也会打印，日志会误导排查）。
+2. 淘汰**只发生在本次加载的区块内**（索引给出的那一桶），不额外扫全表——否则又变回 O(总数)。
+
+**残留情形（有意接受，不是 bug）**：一个在整个会话里始终加载的区块不会再触发 `ChunkEvent.Load`，所以
+那里的死 hint 要等它下一次加载（离开再回来，或重启服务器）才会被清掉。它们**无害**（下面没有东西），
+只是暂时占一条内存/磁盘记录。
+
+**为什么不做"上限/强制裁剪"**：任何"超过 N 条就丢最旧的"式裁剪都可能丢掉**仍守着真实数据**的 hint
+（hint 是漏抽兜底的唯一线索，丢了就等于把那些包裹判了死刑）。这里的界是**按数据存活来定的**：
+只有当键下面真的什么都没有时才淘汰，所以既能收敛又不可能丢东西。
+
 **为什么提示必须持久化**：提示曾经只在内存里，那留了一个洞——重启之后所有提示都没了，一个"被我们
 没 hook 的路径移除了容器"或"漏抽后立刻崩了"的池**永远无法解决**，包裹烂在 SavedData 里。
 持久化提示关掉了这个洞，因为 `OrphanSweep` 在**每次区块加载**时都会重跑，而现在它有位置可以探测了
-（`ContainerHintRegistry.hints` 首次访问时从磁盘播种）。
+（任何访问第一次都会经 `ContainerHintRegistry.state(...)` 从磁盘播种，索引同时重建）。
 
 **孤儿兜底的日志是唯一一条无条件打印的**（不受 `DEBUG_LOGGING` 控制），因为它是"物品被救回来了"
 这种值得知道的事：
@@ -1396,7 +1529,14 @@ self.queuedExitingPackages.clear();     // ← ② 后清私有队列
 按当前顺序，万一两步之间出问题，最坏情况是**重复**一个包裹（可恢复，而且因为两个结构都在内存里，
 只可能发生在同一个 tick 内）——**绝不会丢一个**。
 
-**红石**：整条 (A)/(B)/(C) 都**没有红石门**。理由见 §3.9⑦。
+**红石**：(A) 上交 与 (C) 直接入池**对任何机器都没有红石门**（它们只搬运已经生产出来的包裹）；
+(B) 取包**有**红石门，但**只对 opt-in 了 `RepackagerLike` 的机器生效**
+（`canPoll = idle && (!repackagerLike || self.redstonePowered)`：Create 与 FluidLogistics 的理包机 opt-in，
+普通打包机不 opt-in）。
+
+**来源**：三条路径都按"这台机器是不是理包机"打标记（`Origin`），取包时只取同来源的（§3.21）。所以
+"生产者无关"指的是**上交不挑生产者**（谁把包裹放进私有队列都会被收进池），而不是"谁都能取走"。
+理由见 §3.9⑦。
 
 ### 3.20 【新增】单方块容器：为什么注 `LevelChunk.removeBlockEntity` 而不是 `BlockEntity.setRemoved`
 
@@ -1458,6 +1598,56 @@ private void createPackageInnovation$onContainerRemoved(BlockPos pos, CallbackIn
 
 **为什么它在主配置里**（`required = true`, `defaultRequire = 1`）：如果它注不进去，池会照常工作，
 但**没有任何东西会在单方块容器被移除时把它爆出来**——物品静默丢失。**响亮地失败是正确的结果。**
+
+### 3.21 【新增】按生产者分流：理包机的有序包裹只由理包机发
+
+**要解决的问题（现场反馈）**：池原本只按**容器**分桶，`poll()` 既不记录也不检查"这包是谁产的"。于是
+理包机整理好的**有序包裹**进了池以后，任何容器上贴着的机器都能取走——包括**后贴上去的打包机**。
+而"谁取走"决定了包裹**从谁的输出面出去**：被打包机取走就去打包机那一侧，而不是理包机那一侧。
+
+> 注意这不是"打包机抢了理包机的输入"。碎片进池的唯一途径是某台打包机把容器里的碎片包裹抽出来
+> （`attemptToSend` 的直通分支，偏移 356 `instanceof PackageItem`），那是**入池之前**的事；本节讲的是
+> **出池之后由谁发**。
+
+**做法：每条池记录带一个"生产者种类"标记，取包只取与自己同来源的。**
+
+```java
+public enum Origin { UNKNOWN(0), REPACKAGER(1), PACKAGER(2) }   // 码值是持久化的，不可重排/复用
+
+public void deposit(UUID vault, List<BigItemStack> batch, Origin origin)
+public BigItemStack poll(UUID vault, Origin requester)          // 跳过 origin 不同且非 UNKNOWN 的条目
+```
+
+- **来源怎么判**：`self instanceof RepackagerLike`（§3.9⑦ 同一个标记接口）——Create 的理包机与
+  FluidLogistics 的流体理包机都 opt-in 了，普通打包机没有。三条入池路径各自打标记（§2.3①），
+  包括"上交"兜底那条（标记 = 正在上交的这台机器：它的私有队列由它自己或其引擎填充）。
+- **不新增第二个 SavedData、也不改 key**：标记只是每条目多一个 byte（`CpiOrigin`）。**这是新键，不是改键名**
+  ——AGENTS.md §4 禁止的是重命名已写入存档的键。
+- **旧存档兼容**：没有这个标记的条目读成 `Origin.UNKNOWN`，**任何机器都能取** —— 与改动前逐字一致，
+  所以升级不会让任何已有包裹被卡住。`UNKNOWN` 也永远不会被新数据写入（只由 `load` 产生）。
+- **并行度保留**：同类机器之间仍然共享**同一个**队列，所以"一台保险库 + 3 台理包机 ≈ 3 倍速度"这条
+  核心收益完全不变；被拆开的只是**跨类**的借用。
+
+**为什么不是"两个池"**：效果上等价，但把 key 变成 "容器 + 种类"要动 `SharedPackagePool` 的 key 结构
+（`drainAndDrop` / `migrateKey` / `ContainerHintRegistry` 都要按两个键走一遍），而且旧存档的条目仍然要
+回答"它属于哪个池"——最后还是得有一个 `UNKNOWN`。每条记录带标记是同一语义下的最小改动。
+
+**⚠️ 代价（有意接受，必须知道）**：容器上**没有**对应种类的机器时，那些条目会**停在池里等**
+（不丢、不爆、不发）。这正是"按来源分流"的定义所要求的，而且与既有的 vault-centric 生命周期一致：
+放回一台同种类的机器就继续发；拆掉容器则由 `drainAndDrop` 全量爆成掉落物（§3.9④、§2.6）。
+**不要**为了让它们"动起来"而给别的种类开一条兜底通道——那正是本节要修掉的问题。
+
+**日志**：四处 `[CPI-POOL]` 行都带上了种类（`fed 1 REPACKAGER package to packager at …`、
+`deposited 1 PACKAGER package …`、`handed over N queue entr(ies) as PACKAGER from …`），
+所以"谁产、谁发"可以直接对账（§6.1）。
+
+**不要改回去的地方**：
+
+> ❌ **不要**让 `poll` 在"自己这一类没有可发条目时"回退去取另一类——那就是把本节的规则删掉。
+> ❌ **不要**给普通打包机 opt-in `RepackagerLike` 来"顺手让它也能发理包机的包裹"——那会让它把有序包裹
+> 从自己的输出面发出去，正是本节要修的症状。
+> ❌ **不要**重排/复用 `Origin` 的码值，也**不要**改 `UNKNOWN` 的含义（它是旧存档的兼容值）。
+> ❌ **不要**把 `drainAndDrop` 改成"只爆同来源"——容器没了就没有任何机器可路由，包裹必须全部掉给玩家。
 
 ---
 
@@ -1681,13 +1871,14 @@ fluidlogistics-1.3.0-mc1.20.1.jar         -> fluidlogistics
 
 | 日志行 | 触发点 | 说明 |
 |---|---|---|
-| `deposited N package(s) from <pos> (vault pending: M)` | `RepackagerBlockEntityMixin` 的 `addAll` redirect | 理包机整理后整批入池；`N` 按 Σ`max(1,count)` 计 |
-| `deposited 1 package from packager at <pos> (vault pending: M)` | `PackagerBlockEntityMixin` 的 `List.add` redirect | **普通打包机**（或任何走父类 `attemptToSend` 的机器）装好 1 个直接入池 |
-| `handed over N queue entr(ies) from packager at <pos> (vault pending: M)` | `tick` HEAD 的上交分支 | 任何来源的私有积压被交给池（§3.19A） |
-| `fed 1 package to packager at <pos> (vault pending: M)` | `tick` HEAD 的取件分支 | 空闲机器取走 1 个（**不是** `repackager`——普通打包机也取） |
+| `deposited N REPACKAGER package(s) from <pos> (vault pending: M)` | `RepackagerBlockEntityMixin` 的 `addAll` redirect | 理包机整理后整批入池；`N` 按 Σ`max(1,count)` 计 |
+| `deposited 1 <ORIGIN> package from packager at <pos> (vault pending: M)` | `PackagerBlockEntityMixin` 的 `List.add` redirect | **普通打包机**（或任何走父类 `attemptToSend` 的机器）装好 1 个直接入池；`<ORIGIN>` = `PACKAGER`/`REPACKAGER`（§3.21） |
+| `handed over N queue entr(ies) as <ORIGIN> from packager at <pos> (vault pending: M)` | `tick` HEAD 的上交分支 | 任何来源的私有积压被交给池，并打上这台机器的来源标记（§3.19A、§3.21） |
+| `fed 1 <ORIGIN> package to packager at <pos> (vault pending: M)` | `tick` HEAD 的取件分支 | 空闲机器取走 1 个，**只取与自己同来源的**（§3.21）；**不是**只服务理包机——普通打包机也取自己那一类 |
 | `drained & dropped N package(s) at vault <pos>` | `SharedPackagePool.drainAndDrop` | 容器**全拆**，整池爆出。**部分拆不该出现这行**（§3.16） |
 | `two-vault merge resolved: winner=<uuid>, migrated N package(s) to winner` | `SharedPackagePool.resolveMergeWinner` | 两个独立容器合并，输家池迁到赢家（罕见） |
-| `orphan sweep dropped a pool whose container is gone (dim=…, pos=…)` | `OrphanSweep` | 漏抽兜底。**无条件打印**，不受 `DEBUG_LOGGING` 控制 |
+| `orphan sweep dropped a pool whose container is gone (dim=…, pos=…)` | `OrphanSweep` | 漏抽兜底。**无条件打印**，不受 `DEBUG_LOGGING` 控制。**只在真的回收了东西时打印**：键下既无池内容也无被接管订单的死 hint 走的是**静默淘汰**，不会打这一行（§3.14「惰性淘汰」） |
+| `evicted a dead container hint (no packages, no tracked orders; dim=…, pos=…)` | `OrphanSweep` 的惰性淘汰分支 | 正常的清理（不是"救回了物品"），所以只在 `DEBUG_LOGGING` 时打印。**验证 hint 集合有界**就看它（§3.14「惰性淘汰」） |
 | `detected legacy BoundingBox-keyed SavedData (N vault(s), ~M package(s)); clearing pool on upgrade...` | `SharedPackagePool.load` | **警告级**，升级清空（§3.9⑧）。无条件打印 |
 | `ignoring a container hint with an unparsable dimension '<id>'` | `ContainerHintStore.dimensionOf` | **警告级**，坏存档条目不致命。无条件打印 |
 
@@ -1720,10 +1911,14 @@ order(s)`（reshape 迁移版，本模组 reshape 不迁移，key 不变）。
 | 游戏启动崩溃（tick 相关） | tick 注入点写错：必须注父类 `PackagerBlockEntity`（§3.9①） |
 | 游戏启动崩溃 `IllegalClassLoadError: … is in a defined mixin package` | 有代码直接引用了注册在 `mixin` 包里的类。duck interface 必须放**普通包**（如 `identity/`，§3.11 末段） |
 | 游戏启动崩溃（打开仓库管理员时） | `@Inject` 参数类型和目标方法不匹配（§3.3） |
-| **打包机/理包机"吞物品"、订单静默停摆** | 有人给池的灌入加回了 `if (!self.redstonePowered) return;`。**删掉它**——vanilla `tick()` 没有红石检查，加闸门会让我们比原版更严：已被交给池、之后红石又被切断的包裹永远取不回来（§3.9⑦） |
-| 打包机无需红石也工作（觉得是 bug） | **这不是 bug**，是刻意与 vanilla 对齐（§3.9⑦）。发出去的包裹本来就是 vanilla 无条件排空队列的行为 |
+| **打包机/理包机"吞物品"、订单静默停摆** | 有人把红石闸门挪到了**整个注入**上（`if (!self.redstonePowered) return;`），把"上交"也一起挡掉了。闸门必须**只加在取包那一半**（`canPoll`）——vanilla `tick()` 没有红石检查，给上交加闸门会让我们比原版更严：已生产出来的包裹连进池都做不到（§3.9⑦） |
+| **打包机必须通红石才能取包裹** | 取包闸门被扩大到了所有机器（即 `canPoll` 少了 `!repackagerLike \|\|` 那一半），或者给普通打包机也 opt-in 了 `RepackagerLike`。闸门**只对 opt-in 的理包机生效**——普通打包机在共享容器上常常根本没接红石，闸住它就等于整池没人取（§3.9⑦） |
+| 理包机断电后池里的包裹停在池里不发（觉得是 bug） | **这是设计**：理包机的取包受红石闸门（`canPoll = idle && (!repackager \|\| redstonePowered)`，§3.9⑦）。包裹留在 SavedData 里**不会丢**，该理包机重新通电就继续发。注意：容器上若还有普通打包机，它们**会**继续取包，所以发送不会全停——想全停就给每台机器接线 |
+| 理包机断电后仍在取包（觉得是 bug） | 闸门被删了，或 `!repackagerLike \|\|` 那半写漏了，或那台机器**没有 opt-in** `RepackagerLike`（§3.9⑦）。**变体特别容易漏**：Create: FluidLogistics 的流体理包机不继承 `RepackagerBlockEntity`，必须靠它自己的 compat mixin opt-in。注意断电侧的响应最多滞后一个 lazy tick（10 tick = 0.5 秒），这是 `redstonePowered` 的刷新周期 |
 | **包裹卡在一台机器的 `heldBox` 里、队列再也不动** | 下游抽不动（库存满 / 无下游 / 下游被拆）。`heldBox` 只能被下游 `PackagerItemHandler.extractItem` **被动**清空（§3.8）。**修下游，不要去改 heldBox**。注意这是 vanilla 行为，不是本模组引入的——但本模组的池会因此把活流向别处，所以整体吞吐仍在 |
-| **下游堵塞时积压不消散** | 确认堵塞机被 `!heldBox.isEmpty()` 守卫挡住：开 DEBUG 看 `fed 1 package` 是否只出现在**非**堵塞机上（§2.3②） |
+| **打包机把理包机整理好的有序包裹拿走了** | 按来源分流（§3.21）失效了。三种原因：① 该条目是**旧存档**里的（没有 `CpiOrigin` 标记 → `UNKNOWN` → 任何机器可取的**兼容行为**，取完自然就恢复正常）；② 给普通打包机 opt-in 了 `RepackagerLike`；③ `poll(vault, origin)` 被改回了不筛来源的版本。看 DEBUG 日志里 `fed 1 <ORIGIN> package` 的 `<ORIGIN>` 与机器种类是否匹配 |
+| **池里有包裹但没人发（`vault pending` 不动）** | 池里剩下的是**另一种来源**的条目，而容器上没有对应种类的机器——**这是按来源分流的固有代价**（§3.21），不是丢失：放回一台同种类的机器就继续发，拆掉容器则全部爆成掉落物。开 DEBUG 看 `fed` 一行都不出现、而 `deposited … <ORIGIN>` 说明过池里有那个来源 |
+| **下游堵塞时积压不消散** | 确认堵塞机被 `!heldBox.isEmpty()` 守卫挡住：开 DEBUG 看 `fed 1 …` 是否只出现在**非**堵塞机上（§2.3②） |
 | **拆容器时整池被爆出来（本应部分拆）** | `splitMulti` 的注入点被改回了 `HEAD`（§3.16一）。必须留在 **TAIL**——HEAD 时幸存方 UUID 还是 null，"找同 UUID 兄弟"必然落空 |
 | **拆容器一个方块后，机器继续合成、同时又爆出物品** | 同上。正确行为：**拆一个 part 不应出现 `drained & dropped` 日志**。若出现了，先查注入点是不是 TAIL，再查三段判定链（§3.11、§3.17） |
 | **高流体罐从半腰被拆，池被爆出来** | §3.17 的连通性行走兜底没跑（或第三段判定被删掉）。`±11` 半径对"高度来自配置"的罐子不够用 |
@@ -1804,7 +1999,7 @@ FluidLogistics 的 `com.yision.*`）在本机**没有对应的 jar**，本文档
 | §3.9②（`ConnectivityHandlerMixin.java:68`） | §3.9② `splitMulti` 可见性：不能注 private `splitMultiAndInvalidate` | 一致 |
 | §3.9③（`VaultGeometry.java:46`、`ConnectivityHandlerMixin.java:28,98`） | §3.9③ `isController()` / `getControllerBE()` footgun | 一致 |
 | §3.9⑤（`VaultIdentity.java:39`、`VaultGeometry.java:17`）/ 代码里也写作 §3.9.5 | §3.9⑤ 混入类里不能有 public/static 普通方法 | 一致（本文档为可读性写成 §3.9⑤，与代码里的 §3.9.5 是同一节） |
-| §3.9⑦（本仓库 `AGENTS.md` §4；上游代码） | §3.9⑦ tick HEAD 灌队列与红石闸门 | **⚠️ 刻意分歧**：上游要求加 `if (!self.redstonePowered) return;`，**本模组刻意不加**，理由见该节 |
+| §3.9⑦（本仓库 `AGENTS.md` §4；上游代码） | §3.9⑦ tick HEAD 灌队列与红石闸门 | **⚠️ 刻意分歧（三重）**：上游把 `if (!self.redstonePowered) return;` 加在**整个注入、所有机器**上；本模组（a）只加在**取包**那一半——**上交那一半永远不加**（加了会吞物品）；（b）取包闸门**只对 opt-in 了 `RepackagerLike` 的机器生效**（Create 与 FluidLogistics 的理包机），普通打包机不看红石。理由见该节 |
 | §3.10（本仓库 `AGENTS.md` §9；上游） | §3.10 部分重组的五条不变量 | **一致，未变**（load-bearing，必须保留） |
 | §3.11（`SharedPackagePool.java:31,62,210`、`PartialOrderTracker.java:33`、`ContainerIdSupport.java:38`、`VaultExtraData.java:10`） | §3.11 容器身份：为什么必须是 BE 上的稳定 UUID | **⚠️ 部分分歧**：UUID 方案一致，但本仓库的身份**不再只认保险库**（新增 §3.12/§3.13） |
 | §4.3（`PartialRepackager.java:31`） | §4.3 部分重组：历次失败路线与成功路线 | **一致，未变** |
@@ -1818,6 +2013,7 @@ FluidLogistics 的 `com.yision.*`）在本机**没有对应的 jar**，本文档
 | （新增） | §3.18 流体罐适配器的两处刻意省略与代价 | 本模组新增 |
 | （新增） | §3.19 打包机路径入池 + at-least-once 顺序 | 本模组新增 |
 | （新增） | §3.20 单方块容器为什么注 `removeBlockEntity` 而不是 `setRemoved` | 本模组新增 |
+| （新增） | §3.21 按生产者分流：理包机的有序包裹只由理包机发 | 本模组新增（`SharedPackagePool.Origin` + `identity/RepackagerLike`） |
 
 > **一致性提示**：本仓库 `AGENTS.md` 开头的警告说"代码注释里的 `§x.y` 目前来自上游 TECHNICAL.md"。
 > 本文档落地后，**表中每一个编号在本仓库 TECHNICAL.md 里都已存在**（内容按本仓库实现改写，
@@ -1858,3 +2054,6 @@ FluidLogistics 的 `com.yision.*`）在本机**没有对应的 jar**，本文档
 | Create: Connected `ItemSiloBlockEntity` 的方法/字段 | **确证** `read`/`write`（protected）、`notifyMultiUpdated`、`getMaxWidth`、`getMaxLength` 都存在；**并且它没有自己的 extraData 三件套**（沿用接口默认方法）→ silo 适配器覆写三件套不会顶掉任何实现，**与流体罐的情况根本不同** | `create-connected-1.2.3-mc1.20.1.jar` |
 | Create: Storage `StorageNetworkIdentifier` 的 record 组件 | **确证**：`(controllerPos: BlockPos, memberPositions: Set<BlockPos>)` + 同名访问器 | `create-storage-neo-forge-oSsfZYxj.jar` |
 | Create: FluidLogistics `FluidPackagerBlockEntity.fluidTarget` | **确证**：`public TankManipulationBehaviour fluidTarget`（与 `@Shadow` 逐字一致），该类 `extends PackagerBlockEntity` | `createfluidlogistic-1.3.0-mc1.20.1.jar` |
+| Create: FluidLogistics `FluidRepackagerBlockEntity` 的继承关系与覆写面（§3.9⑦ 引入 `RepackagerLike` 的依据） | **确证**：`extends PackagerBlockEntity`——**不是** `RepackagerBlockEntity` 的子类；**没有** `fluidTarget` 字段（只有 `stalledPackages` / `externalItemHandler` / `itemHandlerCap`）；**覆写** `tick()` 但字节码偏移 1 即 `invokespecial PackagerBlockEntity.tick()`（所以我们的 tick HEAD 注入对它照常生效）；**覆写** `attemptToSend(List)`（所以父类那条 `List.add` redirect 对它不生效，它靠"上交"分支入池）；**没有** `attemptToRepackage` | `createfluidlogistic-1.3.0-mc1.20.1_mapped_parchment_2023.08.20-1.20.1.jar`（`javap -p -c`） |
+| "包裹类型"的判据：`PackageRepackageHelper.isFragmented(stack)` | **确证**：就是 `stack.hasTag() && stack.getTag().contains("Fragment")`——碎片包裹靠 NBT 里的 `Fragment` 标记区分，**理包机的产物（有序包裹）没有这个标记** | `create-1.20.1-6.0.8-289-slim.jar`（`javap -p -c`） |
+| `PackagerBlockEntity.attemptToSend` 会**原样转发**容器里已有的包裹（碎片也一样） | **确证**：偏移 356 `instanceof PackageItem` → 存进局部变量 5（初始 `ItemStack.EMPTY`，偏移 65–68）→ 走"直通"分支发送；只有非包裹才走偏移 558 `PackageItem.containing(handler)`（现包）。这就是"打包机可能把碎片包裹当普通物品发走"的机制 | 同上 |

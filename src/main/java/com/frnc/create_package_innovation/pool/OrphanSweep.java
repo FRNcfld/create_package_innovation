@@ -9,7 +9,6 @@ import com.frnc.create_package_innovation.partial.PartialOrderTracker;
 import net.minecraft.core.BlockPos;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerLevel;
-import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraftforge.event.level.ChunkEvent;
@@ -18,7 +17,6 @@ import net.minecraftforge.fml.common.Mod;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -45,6 +43,33 @@ import java.util.UUID;
  * previous session: the first read after a restart seeds the in-memory map from disk, and
  * every chunk load after that can probe them. The hints live in their own SavedData file, so
  * nothing here touches the pool or tracker format and existing pools keep their keys.</p>
+ *
+ * <h3>Cost per chunk load</h3>
+ *
+ * <p>A chunk load can only ever resolve hints whose position is inside that chunk, so the
+ * sweep asks {@link ContainerHintRegistry#keysInChunk} for exactly that bucket instead of
+ * walking the whole registry. The old whole-registry walk made every chunk load — and chunk
+ * loads happen constantly while a player moves — O(total hints), where "total hints" grows
+ * with the number of containers that have ever had a machine attached.</p>
+ *
+ * <h3>Lazy eviction (what keeps the hint set bounded)</h3>
+ *
+ * <p>Hints are recorded by {@code VaultIdentity} on every key resolution, i.e. for every
+ * container a machine is attached to, whether or not it holds anything. They used to be
+ * removed only when a drain resolved the key, so a container whose packager was removed — or
+ * one that simply finished shipping — kept a dead hint in memory and on disk forever.</p>
+ *
+ * <p>The sweep now drops any hint in the loaded chunk whose key has neither pooled packages
+ * ({@link SharedPackagePool#pending}) nor tracked orders
+ * ({@link PartialOrderTracker#hasOrders}) left. That cannot lose anything: with nothing under
+ * the key, no drain could ever recover something for it, and the next deposit under that key
+ * records the hint afresh — the deposit paths resolve the key through {@code VaultIdentity}
+ * <em>before</em> depositing.</p>
+ *
+ * <p>Residual case, deliberately accepted: a chunk that stays loaded for a whole session is
+ * never re-probed until it loads again (next session, or when the player leaves and returns),
+ * so dead hints there can outlive the moment their data disappeared. They are harmless —
+ * nothing is filed under them — and they are cleaned up on the next load of that chunk.</p>
  */
 @Mod.EventBusSubscriber(modid = CreatePackageInnovation.MOD_ID)
 public final class OrphanSweep {
@@ -58,20 +83,37 @@ public final class OrphanSweep {
         MinecraftServer server = serverLevel.getServer();
         if (server == null) return;
 
-        Map<UUID, ContainerHintRegistry.Hint> hints = ContainerHintRegistry.hints(server);
-        if (hints.isEmpty()) return;
-
         int chunkX = chunk.getPos().x;
         int chunkZ = chunk.getPos().z;
+
+        // Only the hints that live in the chunk that just loaded can be decided here. Empty for
+        // almost every chunk load, which is the point of the index.
+        List<UUID> keys = ContainerHintRegistry.keysInChunk(server, serverLevel.dimension(), chunkX, chunkZ);
+        if (keys.isEmpty()) return;
+
+        SharedPackagePool pool = SharedPackagePool.get(server);
+        PartialOrderTracker tracker = PartialOrderTracker.get(server);
         List<UUID> orphans = null;
 
-        for (Map.Entry<UUID, ContainerHintRegistry.Hint> entry : hints.entrySet()) {
-            UUID key = entry.getKey();
-            ContainerHintRegistry.Hint hint = entry.getValue();
-            if (!hint.dimension().equals(serverLevel.dimension())) continue;
-
+        for (UUID key : keys) {
+            ContainerHintRegistry.Hint hint = ContainerHintRegistry.hint(server, key);
+            if (hint == null) continue;
             BlockPos pos = hint.pos();
-            if ((pos.getX() >> 4) != chunkX || (pos.getZ() >> 4) != chunkZ) continue;
+
+            // Lazy eviction: nothing is filed under this key any more, so the hint guards
+            // nothing. Drop it (memory + disk) instead of letting it accumulate; a later
+            // deposit re-records it. Checked before the liveness probe on purpose — there is no
+            // point probing a key that has nothing to rescue, and the "orphan sweep dropped a
+            // pool" line below then only ever reports entries that really held something.
+            if (pool.pending(key) == 0 && !tracker.hasOrders(key)) {
+                ContainerHintRegistry.forget(server, key);
+                if (CreatePackageInnovation.DEBUG_LOGGING) {
+                    CreatePackageInnovation.LOGGER.info(
+                            "[CPI-POOL] evicted a dead container hint (no packages, no tracked orders; dim={}, pos={})",
+                            hint.dimension().location(), pos);
+                }
+                continue;
+            }
 
             // Cheap verdict first: the chunk is loaded (that is what this event means), so
             // this is a map lookup and can never trigger a chunk load.
@@ -109,11 +151,11 @@ public final class OrphanSweep {
         if (orphans == null) return;
 
         for (UUID key : orphans) {
-            ContainerHintRegistry.Hint hint = hints.get(key);
+            ContainerHintRegistry.Hint hint = ContainerHintRegistry.hint(server, key);
             if (hint == null) continue;
             BlockPos pos = hint.pos();
-            SharedPackagePool.get(server).drainAndDrop(key, serverLevel, pos);
-            PartialOrderTracker.get(server).drainAndDrop(key, serverLevel, pos);
+            pool.drainAndDrop(key, serverLevel, pos);
+            tracker.drainAndDrop(key, serverLevel, pos);
             ContainerHintRegistry.forget(server, key);
             // Rare (a missed drain) and worth knowing about: items were recovered rather than
             // staying stranded in SavedData, so this one is logged unconditionally.

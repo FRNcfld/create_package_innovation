@@ -1,8 +1,10 @@
 package com.frnc.create_package_innovation.mixin;
 
 import com.frnc.create_package_innovation.CreatePackageInnovation;
+import com.frnc.create_package_innovation.identity.RepackagerLike;
 import com.frnc.create_package_innovation.identity.VaultIdentity;
 import com.frnc.create_package_innovation.pool.SharedPackagePool;
+import com.frnc.create_package_innovation.pool.SharedPackagePool.Origin;
 import com.simibubi.create.content.logistics.BigItemStack;
 import com.simibubi.create.content.logistics.packager.PackagerBlockEntity;
 import net.minecraft.server.MinecraftServer;
@@ -31,11 +33,16 @@ import java.util.UUID;
  *       that, from its {@code ResourcePackagerEngine} and its repackager subclass) — there is
  *       no single seam to redirect for those. Draining the queue instead means whatever they
  *       produced ends up shared without us having to know who produced it.</li>
- *   <li><b>Poll</b> (part B): at {@code tick} HEAD an idle packager takes one package back out
- *       of the pool into its private queue; vanilla's tick then ships it as usual (strategy A).
- *       Previously restricted to repackagers by an {@code instanceof} guard — that guard is
- *       gone, which is the point: before this, a large order was handed to one packager and
- *       that single machine emitted one package per second while its neighbours watched.</li>
+ *   <li><b>Poll</b> (part B): at {@code tick} HEAD an idle packager takes one package back out of
+ *       the pool into its private queue; vanilla's tick then ships it as usual (strategy A). Two
+ *       conditions narrow what it may take: the entry must have been produced by <em>its own kind</em>
+ *       of machine (a 打包机 never carries off a 理包机's ordered packages — §3.21), and a machine
+ *       that implements {@link RepackagerLike} must also be powered (see the redstone note in the
+ *       handler). A plain packager is not gated on redstone, and the hand-over is never gated for
+ *       anyone. Previously the whole hook was restricted to repackagers by an {@code instanceof}
+ *       guard — that guard is gone, which is the point: before this, a large order was handed to
+ *       one packager and that single machine emitted one package per second while its neighbours
+ *       watched.</li>
  *   <li><b>Deposit</b> ({@link #createPackageInnovation$depositToPool}): the parent's
  *       {@code attemptToSend} is where a plain packager enqueues what it assembled; redirect
  *       that insert straight into the pool so the batch never becomes private in the first
@@ -60,9 +67,12 @@ import java.util.UUID;
  * so the private queue stays at 0~1 elements and vanilla sees no difference; the
  * {@code heldBox} passive-clear protocol is untouched. A stalled packager
  * ({@code heldBox} non-empty) is blocked by the {@code !heldBox.isEmpty()} guard and receives
- * nothing until its downstream clears. The hand-over deliberately does <em>not</em> require
- * redstone: relocating an already-produced backlog to the pool lets the container's powered
- * machines ship it, which is exactly the desired sharing.</p>
+ * nothing until its downstream clears. Polling additionally requires {@code redstonePowered} for
+ * machines that opt in via {@link RepackagerLike}, and is always limited to entries of the poller's
+ * own kind (a plain packager is gated on neither); the hand-over deliberately requires nothing of
+ * the sort: relocating an already-produced backlog to the pool lets the container's other machines
+ * ship it, which is exactly the desired sharing, whereas gating it would stall packages in a way
+ * vanilla never does.</p>
  */
 @Mixin(value = PackagerBlockEntity.class, remap = false)
 public class PackagerBlockEntityMixin {
@@ -76,20 +86,49 @@ public class PackagerBlockEntityMixin {
 
         boolean hasQueue = !self.queuedExitingPackages.isEmpty();
         // "idle" = could accept one package from the pool right now.
-        //
-        // ⚠️ Deliberately NOT gated on redstonePowered. vanilla tick() has no redstone check at
-        // all — it drains queuedExitingPackages unconditionally, and redstone only gates whether
-        // lazyTick/attemptToSend *fills* that queue. Gating our feed on redstone therefore made
-        // us STRICTER than vanilla: a package already handed to the pool by a machine whose
-        // redstone was cut afterwards could never be pulled back, the order silently stalled, and
-        // the items looked swallowed. Matching vanilla (ship whatever is queued, powered or not)
-        // is required for the pool to be safe. Genuinely stalled machines stay protected by the
-        // heldBox guard below.
         boolean idle = self.animationTicks == 0
                 && self.heldBox.isEmpty() && !hasQueue;
 
+        // ⚠️ Two rules keyed off {@link RepackagerLike}: routing (§3.21) and the redstone gate
+        // (§3.9⑦).
+        //
+        //  - ROUTING (both halves): everything this machine deposits is tagged with its kind, and
+        //    poll() only hands back entries of the same kind. That is what stops a 打包机 attached
+        //    to the container from carrying off the ordered packages a 理包机 produced (and sending
+        //    them out of its own output face). Machines of the same kind still share one queue, so
+        //    N repackagers are still ≈ N packages/second.
+        //  - The HAND-OVER below (part A) is never redstone-gated, for ANY machine. vanilla tick()
+        //    has no redstone check at all: it drains queuedExitingPackages unconditionally, and
+        //    redstone only gates whether lazyTick/attemptToSend *fills* that queue. Gating the
+        //    hand-over would make us STRICTER than vanilla — an already-produced package could not
+        //    even be moved into the pool, so the order would stall silently and the items would
+        //    look swallowed. Relocating a produced backlog to the pool is exactly what lets the
+        //    container's other machines ship it.
+        //  - The POLL (part B) is redstone-gated for machines that opt in via
+        //    {@link RepackagerLike}: Create's repackager (through RepackagerBlockEntityMixin) and
+        //    Create: FluidLogistics' fluid repackager (through its compat mixin — it extends
+        //    PackagerBlockEntity directly, so a class check on RepackagerBlockEntity would miss
+        //    it). A repackager is the machine a player actually wires up and expects to stop when
+        //    the signal is cut, so an unpowered one takes nothing. A plain packager is NOT opted in
+        //    and keeps polling regardless of its own redstone state — in practice a plain packager
+        //    on a shared container is a pure sender and is often not wired to redstone at all, and
+        //    gating it made packagers stop shipping the pool entirely.
+        //    Nothing is lost by the gate either way: the packages stay in SavedData and ship as
+        //    soon as that machine is powered again.
+        //    Consequence worth knowing: on a container that has BOTH kinds, cutting the
+        //    repackagers' redstone does not stop shipping, because the plain packagers keep
+        //    polling their own kind's entries. That is intended — put the redstone control on
+        //    every machine of the container if you want a full stop.
+        //  - `redstonePowered` is the same public field vanilla's own production gate reads. It
+        //    is set on the rising edge (activate()) and re-read from the block state in
+        //    lazyTick(), which SmartBlockEntity runs every 10 ticks (lazyTickRate = 10), so this
+        //    gate can trail the actual signal by at most one lazy tick.
+        boolean repackagerLike = self instanceof RepackagerLike;
+        boolean canPoll = idle && (!repackagerLike || self.redstonePowered);
+        Origin origin = repackagerLike ? Origin.REPACKAGER : Origin.PACKAGER;
+
         // Nothing to hand over and not able to take anything → skip the (non-trivial) key lookup.
-        if (!hasQueue && !idle) return;
+        if (!hasQueue && !canPoll) return;
 
         UUID vaultKey = VaultIdentity.vaultIdOf(self);
         if (vaultKey == null) return;
@@ -104,26 +143,29 @@ public class PackagerBlockEntityMixin {
             // duplicate a package (recoverable, and only within this tick since both structures
             // are in-memory) — never lose one. Clearing first would open a window where the batch
             // exists in neither the queue nor the pool.
+            //
+            // Origin = this machine's kind. Its private queue is filled by itself (or by the
+            // engine that drives it), so the machine doing the hand-over is the producer.
             List<BigItemStack> batch = new ArrayList<>(self.queuedExitingPackages);
-            pool.deposit(vaultKey, batch);
+            pool.deposit(vaultKey, batch, origin);
             self.queuedExitingPackages.clear();
             self.setChanged();
             if (CreatePackageInnovation.DEBUG_LOGGING) {
                 CreatePackageInnovation.LOGGER.info(
-                        "[CPI-POOL] handed over {} queue entr(ies) from packager at {} (vault pending: {})",
-                        batch.size(), self.getBlockPos().toShortString(), pool.pending(vaultKey));
+                        "[CPI-POOL] handed over {} queue entr(ies) as {} from packager at {} (vault pending: {})",
+                        batch.size(), origin, self.getBlockPos().toShortString(), pool.pending(vaultKey));
             }
         }
 
-        // ---- (B) take one package back if idle ------------------------------------------
-        if (!idle) return;
-        BigItemStack pkg = pool.poll(vaultKey);
+        // ---- (B) take one package back if idle (repackager: also powered) -----------------
+        if (!canPoll) return;
+        BigItemStack pkg = pool.poll(vaultKey, origin);
         if (pkg != null) {
             self.queuedExitingPackages.add(pkg);
             if (CreatePackageInnovation.DEBUG_LOGGING) {
                 CreatePackageInnovation.LOGGER.info(
-                        "[CPI-POOL] fed 1 package to packager at {} (vault pending: {})",
-                        self.getBlockPos().toShortString(), pool.pending(vaultKey));
+                        "[CPI-POOL] fed 1 {} package to packager at {} (vault pending: {})",
+                        origin, self.getBlockPos().toShortString(), pool.pending(vaultKey));
             }
         }
     }
@@ -142,6 +184,11 @@ public class PackagerBlockEntityMixin {
      * inventory, unsupported multiblock, client side, …), so unrelated setups behave exactly
      * like vanilla. This is an optimisation over the hand-over in {@code tick}: without it the
      * batch would sit private for one tick first.</p>
+     *
+     * <p>The deposited entry is tagged with this machine's kind, so routing (§3.21) applies to the
+     * direct path as well as to the hand-over. The kind is computed from {@link RepackagerLike}
+     * rather than assumed: a repackager variant that did not override {@code attemptToSend} would
+     * reach this redirect too, and must not be tagged as a plain packager.</p>
      */
     @Redirect(
             method = "attemptToSend",
@@ -158,12 +205,13 @@ public class PackagerBlockEntityMixin {
         MinecraftServer server = level.getServer();
         if (vaultKey == null || server == null) return queue.add(pkg);
 
-        SharedPackagePool.get(server).deposit(vaultKey, List.of(bis));
+        Origin origin = self instanceof RepackagerLike ? Origin.REPACKAGER : Origin.PACKAGER;
+        SharedPackagePool.get(server).deposit(vaultKey, List.of(bis), origin);
 
         if (CreatePackageInnovation.DEBUG_LOGGING) {
             CreatePackageInnovation.LOGGER.info(
-                    "[CPI-POOL] deposited 1 package from packager at {} (vault pending: {})",
-                    self.getBlockPos().toShortString(),
+                    "[CPI-POOL] deposited 1 {} package from packager at {} (vault pending: {})",
+                    origin, self.getBlockPos().toShortString(),
                     SharedPackagePool.get(server).pending(vaultKey));
         }
         return true;

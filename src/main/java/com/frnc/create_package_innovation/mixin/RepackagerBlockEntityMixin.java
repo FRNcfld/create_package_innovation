@@ -1,6 +1,7 @@
 package com.frnc.create_package_innovation.mixin;
 
 import com.frnc.create_package_innovation.CreatePackageInnovation;
+import com.frnc.create_package_innovation.identity.RepackagerLike;
 import com.frnc.create_package_innovation.identity.VaultIdentity;
 import com.frnc.create_package_innovation.partial.PartialRepackager;
 import com.frnc.create_package_innovation.pool.SharedPackagePool;
@@ -48,9 +49,16 @@ import java.util.UUID;
  * Create's InventoryIdentifier (for vaults it's Bounds(BoundingBox), a value
  * record keyed on geometry — stable across capability rebuilds; see §3.7). We
  * deliberately do NOT compare raw IItemHandler identity.
+ *
+ * <p><b>Repackager opt-in:</b> {@code implements RepackagerLike} is what tags everything this
+ * machine deposits as repackager output (so only other repackagers may ship it, §3.21) and what
+ * makes its pool polling obey its own {@code redstonePowered} (§3.9⑦). The marker interface exists
+ * precisely so the parent-level hook can test one type instead of naming this class — and so that
+ * repackager <em>variants</em> that do not extend this class (Create: FluidLogistics' fluid
+ * repackager) can opt in from their own compat mixin.</p>
  */
 @Mixin(value = RepackagerBlockEntity.class, remap = false)
-public class RepackagerBlockEntityMixin {
+public class RepackagerBlockEntityMixin implements RepackagerLike {
 
     /**
      * Partial repackaging entry point. Runs a zero-side-effect pre-scan replica
@@ -97,13 +105,13 @@ public class RepackagerBlockEntityMixin {
         }
 
         List<BigItemStack> batch = new ArrayList<>(boxesToAdd);
-        SharedPackagePool.get(server).deposit(vaultKey, batch);
+        SharedPackagePool.get(server).deposit(vaultKey, batch, SharedPackagePool.Origin.REPACKAGER);
 
         if (CreatePackageInnovation.DEBUG_LOGGING) {
             int total = 0;
             for (BigItemStack bis : batch) total += Math.max(1, bis.count);
             CreatePackageInnovation.LOGGER.info(
-                    "[CPI-POOL] deposited {} package(s) from {} (vault pending: {})",
+                    "[CPI-POOL] deposited {} REPACKAGER package(s) from {} (vault pending: {})",
                     total, self.getBlockPos().toShortString(),
                     SharedPackagePool.get(server).pending(vaultKey));
         }

@@ -15,7 +15,8 @@
 
 一个 Forge 1.20.1 Mixin 附加模组（**不是 alpha**，`mod_version=1.0.0`）：让同一容器上的 N 台打包机/理包机
 **并行**完成同一张订单。整理好的包裹不再留在机器私有队列里，而是进入一个**按容器分桶的世界级共享包裹池**；
-空闲机器每 tick 主动取 1 个发送，因此 N 台 ≈ N 倍速度。身份判定不绑死具体类，按容器种类分路：
+空闲的机器每 tick 主动取 1 个发送（**只取与自己同属"理包机/打包机"那一类的包裹**，§3.21；**理包机**还需通电，
+普通打包机不看红石），因此 N 台 ≈ N 倍速度。身份判定不绑死具体类，按容器种类分路：
 
 | 容器种类 | 身份 | 代表 |
 |---|---|---|
@@ -63,11 +64,13 @@ agent 沙箱只允许写会话工作区，而**用户的 Gradle home 在工作�
 
 把 `CreatePackageInnovation.DEBUG_LOGGING` 改成 `true` 重新编译（`CreatePackageInnovation.java:26`，默认 `false`）：
 
-- `[CPI-POOL] handed over N queue entr(ies)` / `deposited … from packager at …` / `fed 1 package to packager at …`
-  — 分别对应：私有积压交给池 / 入池（普通打包机走 `attemptToSend`，理包机走 `attemptToRepackage`）/ 空闲机器取走 1 个
+- `[CPI-POOL] handed over N queue entr(ies) as <ORIGIN>` / `deposited … <ORIGIN> package …` / `fed 1 <ORIGIN> package to packager at …`
+  — 分别对应：私有积压交给池（并打上该机来源）/ 入池（普通打包机走 `attemptToSend`，理包机走 `attemptToRepackage`）/ 空闲机器取走 1 个（**只取与自己同来源的**，§3.21；opt-in 了 `RepackagerLike` 的理包机**断电不取**，含 FluidLogistics 流体理包机；**普通打包机不看红石**，见 §3.9⑦）
 - `[CPI-POOL] drained & dropped N package(s) at vault …` — 容器**全拆**，整池爆出
 - `[CPI-POOL] two-vault merge resolved: winner=…` — 两个独立容器合并，输家池迁到赢家（罕见）
-- `[CPI-POOL] orphan sweep dropped a pool whose container is gone` — 漏抽兜底，**无条件打印**，不受 DEBUG 开关控制
+- `[CPI-POOL] orphan sweep dropped a pool whose container is gone` — 漏抽兜底，**无条件打印**，不受 DEBUG 开关控制；
+  只在这一键下**真的还有池/余料**时才打印（键下已空死的 hint 被静默淘汰，见 `TECHNICAL.md` §3.14「惰性淘汰」）
+- `[CPI-POOL] evicted a dead container hint (…)` — 惰性淘汰，**只在 `DEBUG_LOGGING` 时打印**（正常清理，非"救回物品"）
 - `[CPI-PARTIAL] crafted N package(s) for order …` / `final pass for order …` / `drained N item(s) …` /
   `migrated M tracked order(s) on vault merge …` — 部分趟 / 末班收尾 / 爆余料 / 余料迁移
 
@@ -82,14 +85,15 @@ agent 沙箱只允许写会话工作区，而**用户的 Gradle home 在工作�
 | `CreatePackageInnovation.java`（**根包只留这一个入口类**） | `@Mod` 主类：`MOD_ID` / `LOGGER` / `DEBUG_LOGGING` |
 | `identity/` → `VaultIdentity.java` / `VaultGeometry.java` / `VaultExtraData.java` | 身份分派 / 邻居与连通性扫描 + 区块安全存活探测(Liveness 三态) / UUID 的 Object 通道载体 |
 | `identity/` → `ContainerIdSupport.java` ★ | 容器无关的稳定 UUID 逻辑（extraData 三件套 / `notifyMultiUpdated` / NBT 读写） |
-| `identity/` → `ContainerHintRegistry.java` / `ContainerHintStore.java` | 内存 half（"池键最后出现在哪" + 是否多方块）/ 磁盘 half SavedData(`gdr_container_hints`) |
+| `identity/` → `ContainerHintRegistry.java` / `ContainerHintStore.java` | 内存 half（"池键最后出现在哪" + 是否多方块 + 区块索引）/ 磁盘 half SavedData(`gdr_container_hints`) |
 | `identity/` → `VaultIdAccessor.java` `NetworkAnchorAccessor.java` `FluidTargetAccessor.java` | 三个 duck interface：UUID 桥 / 网络锚点桥 / 流体存储位置桥 |
+| `identity/` → `RepackagerLike.java` | **纯标记接口**（无方法）：opt-in = 「这台是理包机」——产出被打上理包机来源标记（只由理包机取走，§3.21），且"取包"受自身红石闸门约束（§3.9⑦）。Create 理包机与 FluidLogistics 流体理包机都 opt-in；普通打包机不 opt-in（见 §4） |
 | `pool/` → `SharedPackagePool.java` ★ | SavedData(`gdr_shared_package_pool`)：per-容器共享包裹池，key=UUID |
 | `pool/` → `OrphanSweep.java` | `@Mod.EventBusSubscriber`：`ChunkEvent.Load` 时回收容器已消失的池 |
 | `partial/` → `PartialRepackager.java` ★ | 部分重组核心：零副作用预扫描 + 部分趟 + 末班 vanilla `repack()` 收尾 |
 | `partial/` → `PartialOrderTracker.java` ★ | SavedData(`gdr_partial_order_tracker`)：被接管订单的余料/消费进度/上下文 |
 | `mixin/` | `RepackagerBlockEntityMixin`(HEAD 入口 + `addAll` 入池)、`PackagerBlockEntityMixin`(tick HEAD 交给池/取 1 + `List.add` 入池)、`ConnectivityHandlerMixin`(splitMulti **TAIL**)、`ItemVaultBlockEntityMixin`、`FluidTankBlockEntityMixin`(故意少两样，见 §4)、`LevelChunkRemovalMixin`(唯一可 remap)、`PackageRepackageHelperInvoker`(@Invoker) |
-| `mixin/compat/` | **只有这里**能出现 `com.yision.*` / `net.fxnt.*` / `hlysine.*`：`ItemSiloBlockEntityMixin`、`StorageNetworkIdentifierMixin`、`FluidPackagerBlockEntityMixin` |
+| `mixin/compat/` | **只有这里**能出现 `com.yision.*` / `net.fxnt.*` / `hlysine.*`：`ItemSiloBlockEntityMixin`、`StorageNetworkIdentifierMixin`、`FluidPackagerBlockEntityMixin`、`FluidRepackagerBlockEntityMixin`（最后一个只 `implements RepackagerLike`） |
 | `src/main/resources/` | `create_package_innovation.mixins.json`、`…compat.mixins.json`、`META-INF/mods.toml`（占位符由 processResources 展开）、`pack.mcmeta`、`Logo.png` |
 
 ### 两个 mixin 配置的分工（不要合并）
@@ -119,7 +123,8 @@ mixin 方法会被合并进目标类，非 private 的 static 方法会被 Mixin
 Mixin 子系统禁止任何代码直接引用注册在 mixin 包里的类，启动崩
 `IllegalClassLoadError: … is in a defined mixin package … cannot be referenced directly`。
 现有三个都在 `identity/`：`VaultIdAccessor`、`NetworkAnchorAccessor`、`FluidTargetAccessor`
-（理由写在 `VaultIdAccessor.java:41-46`）。把新的 duck interface 放进 `mixin/` 会**立刻**触发这个崩溃。
+（理由写在 `VaultIdAccessor.java:41-46`）。纯标记接口 `RepackagerLike` 同样住在 `identity/`。
+把新的 duck interface 放进 `mixin/` 会**立刻**触发这个崩溃。
 
 > ⚠️ **已知的既存例外，不要照抄**：`PartialRepackager.java`（partial 包）`import` 了
 > `mixin.PackageRepackageHelperInvoker`。`@Invoker` 接口不被合并进目标类，所以按现状工作，但这是
@@ -144,8 +149,11 @@ Create 与第三方模组的目标：`remap = false`（它们自己的名字从�
 | 禁区 | 原因 | 文档位置 |
 |---|---|---|
 | `heldBox` 的**赋值 / 清空** | 清空是**被动**的：应用 `PackagerItemHandler.extractItem` → `setStackInSlot` → `putfield heldBox`（**已 javap 确认** `PackagerItemHandler` 是唯一写点）。打断此协议 = 死锁 / 复制 / 丢失。 | `TECHNICAL.md` §3.8（load-bearing，未变）；`PackagerBlockEntityMixin.java:56-65` |
-| **不能**给池的灌入加 `redstonePowered` 闸门 | 上游手册要求这个闸门，本模组**刻意删除**。原版 `tick()` 没有任何红石检查，无条件排空 `queuedExitingPackages`；红石只决定 `lazyTick`/`attemptToSend` **是否填**队列。加闸门会让我们**比原版更严**：被交给池之后红石又被切断的包裹永远取不回来，订单静默停摆，表现为"打包机吞物品"。 | `PackagerBlockEntityMixin.java:78-89`（javadoc，含 "⚠️ Deliberately NOT gated on redstonePowered"） |
+| **不能**给池的**灌入/上交**加 `redstonePowered` 闸门；**取包闸门也不能扩大到普通打包机**（只有 opt-in 了 `RepackagerLike` 的理包机才受红石闸门约束） | 上游把 `if (!self.redstonePowered) return;` 加在**整个注入、所有机器**上；本模组（a）只把它加在"取包"，且（b）**只对 opt-in 了 `RepackagerLike` 的机器生效**：`canPoll = idle && (!repackagerLike \|\| self.redstonePowered)`。**灌入/上交**（`tick` HEAD 的 `hasQueue` 分支 + `attemptToSend` 的 `@Redirect`）对任何机器都不加：原版 `tick()` 没有任何红石检查，无条件排空 `queuedExitingPackages`，给上交加闸门会让我们**比原版更严**——已生产出来的包裹连进池都做不到，订单静默停摆，表现为"打包机吞物品"。而把取包闸门扩大到普通打包机会让**没接红石的打包机停止取包**（共享容器上的打包机常常只是发货端、根本没接线），表现为"打包机必须通红石才能取包裹"。**opt-in 用标记接口而不是类判断**：FluidLogistics 的流体理包机不继承 `RepackagerBlockEntity`，类判断会漏它；而主 mixin 又不能引用 `com.yision.*`（§3③）。注意 §3.9① 那个"只服务理包机"的早期 `instanceof` 守卫与此无关：前者已永久删除。 | `TECHNICAL.md` §3.9⑦；`PackagerBlockEntityMixin.java:87-116`（含 "⚠️ The redstone gate is scoped to the REPACKAGER — and only to the poll half"）；`identity/RepackagerLike.java` |
 | `BigItemStack.count` 的语义 | `count` 是"**这个包裹要发几次**"，不是"包裹有几个"。`poll()` 按 count 拆分（head 的 `count > 1` 时只取 1 份并 `head.count--`）；`drainAndDrop` 按 count **全量** drop 同样多次。按元素数切分是错的。 | `SharedPackagePool.java:53-58`；`poll()` 155-172；`drainAndDrop()` 186-209 |
+| **不要**去掉按来源分流的 `Origin` 过滤；**不要**给普通打包机 opt-in `RepackagerLike` | 池只按容器分桶时 `poll()` 不区分"这包是谁产的"，一台后贴上去的打包机会把理包机整理好的**有序包裹**取走，并从**打包机自己的输出面**发出去（现场症状）。修法：`deposit(…, origin)` 打来源标记，`poll(vault, requester)` 只取同来源（`UNKNOWN` = 旧存档条目，任何机器可取，兼容）。同类机器之间仍共享同一队列，并行度不变。**代价（有意接受）**：容器上没有对应种类的机器时，那些条目停在池里等（不丢、不爆、不发）。 | `TECHNICAL.md` §3.21；`SharedPackagePool.Origin`；`PackagerBlockEntityMixin.java` |
+| `Origin` 的**码值**（`UNKNOWN=0` / `REPACKAGER=1` / `PACKAGER=2`） | 它们随池条目一起**写进存档**（NBT 新键 `CpiOrigin`）。重排或复用码值 = 把玩家存档里的包裹路由到错误的机器类；改 `UNKNOWN` 的含义 = 让旧存档的条目突然被某一类独占（或不再可取）。 | `SharedPackagePool.Origin`；§3.21 |
+| **不要**把 `drainAndDrop` 改成"只爆同来源" | 容器已经没了，没有机器可以路由，包裹必须**全部**掉给玩家。 | §3.21 |
 | `ConnectivityHandler.splitMulti` 的注入点**必须留在 `TAIL`** | 上游用 HEAD，那是**部分拆误判 bug**：`splitMulti` 只是转调 `splitMultiAndInvalidate`（**已 javap 确认**），而"幸存方块从旧 controller 继承 UUID"（`getExtraData` → `setExtraData`）发生在它里面。HEAD 时幸存方 UUID 还是 null，"找同 UUID 兄弟"必然落空 → 误判全拆 → 爆池 → 订单重做 → 物品复制。 | `ConnectivityHandlerMixin.java:70-83` |
 | 流体罐适配器**故意少两样**：不覆写 extraData 三件套、不挂 `notifyMultiUpdated` | ① `FluidTankBlockEntity.getExtraData()` 返回 `Boolean.valueOf(window)`（**已 javap 确认**字节码读 `window:Z`）——Create 自己占了这个通道，我们再声明就会顶掉罐子的窗口状态同步。② 罐子没有 extraData 交接：若在 `notifyMultiUpdated` 里铸 UUID，重新成形的控制器在 split hook 跑之前就持有新 UUID，adopt 走不会覆盖非 null 值，池变孤儿。所以罐子**首次使用时惰性铸造**（`VaultIdentity` 读到 null 才铸），把位置留给 adopt 走。 | `FluidTankBlockEntityMixin.java:30-55` |
 | 没有适配器的多方块容器必须返回 `null`（不池化） | 对多方块来说位置键**不是 reshape 稳定**的，用它池化会把包裹搁浅。绝不能"退化成位置键"当兜底。 | `VaultIdentity.java:34-36`、`88-93` |
@@ -218,14 +226,14 @@ $z=[System.IO.Compression.ZipFile]::OpenRead($jar); $z.Entries|%{$_.FullName}; $
 | API | 一行说明 |
 |---|---|
 | `SharedPackagePool.get(server)` | 取世界级池实例（SavedData，id `gdr_shared_package_pool`） |
-| `SharedPackagePool.deposit(vault, batch)` | 整批入池（追尾 FIFO），只收 `count > 0` 的条目 |
-| `SharedPackagePool.poll(vault)` / `pending(vault)` / `drainAndDrop(vault, level, pos)` | 从头部取 **1 个发货单位**（`count > 1` 时拆分并留余数；空池 null）/ 待发**总份数**（按 count 求和，**不是**条目数）/ 整池爆成掉落物（幂等） |
+| `SharedPackagePool.deposit(vault, batch, origin)` | 整批入池（追尾 FIFO），只收 `count > 0` 的条目；`origin` 是生产者的种类标记（§3.21），由调用方按 `self instanceof RepackagerLike` 给出 |
+| `SharedPackagePool.poll(vault, requester)` / `pending(vault)` / `drainAndDrop(vault, level, pos)` | 取 **1 个发货单位**，**只取与 `requester` 同来源的**（`count > 1` 时拆分并留余数；没有可取的返回 null）/ 待发**总份数**（按 count 求和，**不是**条目数）/ 整池爆成掉落物（**不分来源**，幂等） |
 | `SharedPackagePool.noteMergeParticipant(id)` / `resolveMergeWinner(tracker)` | 双容器合并的登记与裁决（赢家 = 最小 UUID）；内部用 |
 | `PartialOrderTracker.get(server)` / `get(vault, orderId)` | 追踪器实例（SavedData，id `gdr_partial_order_tracker`）/ 某被接管订单的 `TrackedOrder`（未接管 null） |
 | `PartialOrderTracker.update(vault, orderId, leftovers, consumedFragments, context, address)` | 部分趟后写入余料 + 记录已消费碎片槽 |
-| `PartialOrderTracker.forget(vault, orderId)` / `migrateKey(oldId, newId)` / `drainAndDrop(vault, level, pos)` | 末班收尾删除条目 / 合并时迁移键 / 容器销毁时按 `maxStackSize` 分批爆余料 |
-| `ContainerHintRegistry.remember(server, key, level, pos, multiblock)` | 记录"这个键最后出现在哪"（内存 + 磁盘，仅变更时落盘） |
-| `ContainerHintRegistry.hints(server)` / `forget(server, key)` | 只读视图（首次访问从磁盘播种 = 跨重启兜底的关键）/ 键已解决时同清内存与磁盘 |
+| `PartialOrderTracker.forget(vault, orderId)` / `migrateKey(oldId, newId)` / `drainAndDrop(vault, level, pos)` / `hasOrders(vault)` | 末班收尾删除条目 / 合并时迁移键 / 容器销毁时按 `maxStackSize` 分批爆余料 / 该键下还有没有被接管的订单（`OrphanSweep` 判 hint 是否还需要保留） |
+| `ContainerHintRegistry.remember(server, key, level, pos, multiblock)` | 记录"这个键最后出现在哪"（内存 + 磁盘，仅出现/变化/移位时落盘；同时维护区块索引） |
+| `ContainerHintRegistry.hints(server)` / `hint(server, key)` / `keysInChunk(server, dim, cx, cz)` / `forget(server, key)` | 全量只读视图（**别在事件里遍历它**，那是 O(总 hint 数)）/ 单键查询 / **本次加载区块的键快照**（`OrphanSweep` 用这个，O(本区块)）/ 键已解决或键下已无可救内容时，内存 + 磁盘 + 索引一起清 |
 | `ContainerHintStore.get(server)` | 磁盘 half（SavedData，id `gdr_container_hints`）；**独立文件**，不改动池与追踪器格式 |
 | `VaultGeometry.anySiblingVaultWithUuidExists(level, pos, uuid)` | ±11 立方体扫描：还有没有同 UUID 的幸存部件（判 partial vs 全拆） |
 | `VaultGeometry.adoptUuidOnSurvivingParts(level, pos, block, uuid)` | ±1 邻居加固：把 UUID **写回**没有 UUID 的同方块幸存部件 |
@@ -234,6 +242,7 @@ $z=[System.IO.Compression.ZipFile]::OpenRead($jar); $z.Entries|%{$_.FullName}; $
 | `VaultIdentity.vaultIdOf(packager)` / `positionKey(level, pos)` | 解析目标容器的稳定身份（分路 + 惰性铸造 + 顺手 `remember`）/ 单方块容器的确定性键（UUIDv3 over 维度 + 坐标） |
 | `ContainerIdSupport.onSetExtraData / onNotifyMultiUpdated / onWrite / onRead` | 容器适配器的**全部逻辑**；适配器类只留字段 + 桥方法 + 4 个 hook |
 | `VaultIdAccessor` / `NetworkAnchorAccessor` / `FluidTargetAccessor` | 三个 duck interface（都在 `identity/`） |
+| `RepackagerLike` | **纯标记接口**（无方法，在 `identity/`）：`implements` 它 = 「这台是理包机」——产出被标为理包机来源（只由理包机取走，§3.21），且"取包"受自身红石闸门约束（§3.9⑦）。适配器写法：Create 理包机在 `RepackagerBlockEntityMixin` 上 `implements`，变体在各自 compat mixin 上 `implements`（例：`FluidRepackagerBlockEntityMixin`）。**别给普通打包机加** |
 
 **支持一个新的多方块容器 = 写一个约 60 行的适配器**：`@Unique UUID cpi$vaultId`（需要合并语义时再加
 `@Unique Set<UUID> cpi$observedIds`）、`implements VaultIdAccessor` 的两个 public 桥方法、extraData 三件套
@@ -275,8 +284,10 @@ $z=[System.IO.Compression.ZipFile]::OpenRead($jar); $z.Entries|%{$_.FullName}; $
   `resources/` 里的两个 mixin json、`pack.mcmeta`、`Logo.png`、`META-INF/mods.toml`）。
   **不要把它恢复进本仓库、也不要加进 classpath。** 需要对照字节码时从**只读**的上游仓库取同一份副本：
   `…\github_repository\god-damn-repackager\build\libs\goddamnrepackager-0.5.1-forge-alpha.jar`。
-- 与上游的**有意的分歧**（不要"同步回去"）：没有 `g.sh`、没有 alpha 分类器、多了兼容 mixin 配置、删掉了
-  红石闸门、身份从 BoundingBox 换成 UUID、`splitMulti` 从 HEAD 改到 TAIL，并且**没有** `PUBLISH_*.md` 文件
+- 与上游的**有意的分歧**（不要"同步回去"）：没有 `g.sh`、没有 alpha 分类器、多了兼容 mixin 配置、
+  红石闸门**只加在"取包"那一半、且只对 opt-in 了 `RepackagerLike` 的理包机生效**（上游把它加在整个
+  注入、所有机器上：既会把"上交"一起挡掉 → 吞物品，也会让没接红石的打包机停止取包）、身份从 BoundingBox
+  换成 UUID、`splitMulti` 从 HEAD 改到 TAIL，并且**没有** `PUBLISH_*.md` 文件
   （发布时不要去找它们，也不要凭上游结构新建）。
 
 ---
@@ -303,5 +314,7 @@ $z=[System.IO.Compression.ZipFile]::OpenRead($jar); $z.Entries|%{$_.FullName}; $
     连通性行走 + `Liveness` 三态），读它时必须对照 §4，不要照抄回上游写法
   - `§4.3 部分重组（0.5.0 已实现）：订单接管 + 余料托管 + 末班 vanilla 收尾`
   读它时记住：**它描述的是上游，不是本仓库**；尤其是上游 `§3.9⑦`"tick HEAD 必须守 `redstonePowered`"的
-  结论在本仓库已被**有意推翻**（见 §4 第二行）。
+  结论在本仓库已被**有意收窄**：闸门**只**加在"取包"那一半、且**只对 opt-in 了 `RepackagerLike` 的理包机**
+  生效（Create 与 FluidLogistics 的理包机都 opt-in，普通打包机不 opt-in）；"上交"那一半永远不加
+  （见 §4 第二行）。
 - **`README.md`**：面向玩家的功能表与兼容容器矩阵，是核对"用户可见行为"的权威描述。

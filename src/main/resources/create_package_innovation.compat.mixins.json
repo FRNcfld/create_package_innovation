@@ -7,7 +7,8 @@
   "mixins": [
     "ItemSiloBlockEntityMixin",
     "StorageNetworkIdentifierMixin",
-    "FluidPackagerBlockEntityMixin"
+    "FluidPackagerBlockEntityMixin",
+    "FluidRepackagerBlockEntityMixin"
   ],
   "client": [],
   "injectors": {

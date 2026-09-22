@@ -211,6 +211,18 @@ public class PartialOrderTracker extends SavedData {
     }
 
     /**
+     * Is any order currently tracked under this key?
+     *
+     * <p>Used by {@code OrphanSweep} to decide whether a container hint still guards
+     * recoverable data: leftover materials live here, not in {@code SharedPackagePool}, so a
+     * hint whose pool is empty must still be kept while an order is tracked. Read-only.</p>
+     */
+    public boolean hasOrders(UUID vault) {
+        Map<Integer, TrackedOrder> m = orders.get(vault);
+        return m != null && !m.isEmpty();
+    }
+
+    /**
      * Create-or-update after a partial pass: store the post-craft leftover pool
      * and record which fragments were consumed. context/address refresh from the
      * latest fragments (they're constant per order, but the first pass may see

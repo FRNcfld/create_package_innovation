@@ -255,7 +255,9 @@ public final class PartialRepackager {
                 if (bis.count > 0)
                     self.computerBehaviour.prepareComputerEvent(new RepackageEvent(bis.stack, bis.count));
         }
-        SharedPackagePool.get(server).deposit(vaultKey, boxes);
+        // Tagged as repackager output: these are the ordered packages a 理包机 built, so only
+        // machines of the same kind may ship them (§3.21).
+        SharedPackagePool.get(server).deposit(vaultKey, boxes, SharedPackagePool.Origin.REPACKAGER);
     }
 
     private static int countOf(List<BigItemStack> boxes) {
